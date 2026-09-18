@@ -1,0 +1,68 @@
+{
+  "remote": {
+    "window_title_contains": "10.30.255.10",
+    "activate_before_each_step": true
+  },
+  "ocr": {
+    "tesseract_cmd": "",
+    "lang": "eng",
+    "fuzzy_threshold": 70,
+    "save_debug_images": true,
+    "prefer_negative_latitude": true
+  },
+  "timing": {
+    "after_note_enter": 2.5,
+    "after_tab_click": 1.2,
+    "after_link_click": 1.0,
+    "after_permit": 2.5,
+    "after_maximize": 1.0,
+    "after_close_photo": 1.2,
+    "poll_interval": 0.45,
+    "screen_timeout": 18.0
+  },
+  "automation": {
+    "typing_interval": 0.035,
+    "scroll_pages_links": 5,
+    "scroll_amount": -6,
+    "maximize_photo_window": true,
+    "close_photo_with_alt_f4": true,
+    "continue_when_photo_missing": true,
+    "continue_when_coordinate_missing": true,
+    "targets": [
+      {
+        "key": "FACHADAIMOVEL",
+        "output_suffix": "FACHADAIMOVEL",
+        "aliases": ["FACHADAIMOVEL", "FACHADADOIMOVEL", "FACHADA DO IMOVEL", "FACHADA"]
+      },
+      {
+        "key": "ADESIVOLIGACAONOVA",
+        "output_suffix": "ADESIVOLIGACAONOVA",
+        "aliases": ["ADESIVOLIGACAONOVA", "ADESIVO LIGACAO NOVA", "ADESIVO"]
+      },
+      {
+        "key": "FOTOPANORAMICA",
+        "output_suffix": "FOTOPANORAMICA",
+        "aliases": ["FOTOPANORAMICA", "FOTO PANORAMICA", "PANORAMICA"]
+      }
+    ]
+  },
+  "output": {
+    "root_folder": "saida",
+    "create_zip": true,
+    "create_consolidated_excel": true
+  },
+  "points": {
+    "note_field_initial": [0.125, 0.192],
+    "note_field_detail": [0.099, 0.143],
+    "dados_campo_2_fallback": [0.329, 0.198],
+    "imagens_campo_fallback": [0.274, 0.243],
+    "permitir_fallback": [0.359, 0.55]
+  },
+  "regions": {
+    "top_detection": [0.0, 0.04, 0.72, 0.25],
+    "tabs": [0.0, 0.14, 0.76, 0.16],
+    "links": [0.015, 0.255, 0.64, 0.48],
+    "security_popup": [0.28, 0.27, 0.48, 0.4],
+    "photo_content": [0.0, 0.045, 1.0, 0.95]
+  }
+}

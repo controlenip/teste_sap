@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, Iterable, Optional
+
+import pyautogui
+from PIL import Image
+
+from .config import APP_DIR, norm_point_to_abs, resolve_output_root
+from .excel_utils import save_work_excel, update_consolidated
+from .vision import (
+    click_text,
+    extract_coordinates_from_photo,
+    extract_largest_photo_from_screen,
+    locate_text_on_screen,
+    ocr_lines,
+    save_debug_image,
+    screenshot_full,
+    screenshot_norm_region,
+    wait_for_text,
+)
+from .window_control import activate_window_contains
+
+ProgressCallback = Callable[[str, str, Optional[float]], None]
+
+
+class SAPPhotoBot:
+    def __init__(self, cfg: Dict, callback: Optional[ProgressCallback] = None):
+        self.cfg = cfg
+        self.callback = callback or (lambda level, msg, progress=None: None)
+        self.screen_size = tuple(pyautogui.size())
+        self.output_root = resolve_output_root(cfg)
+        self.debug_root = APP_DIR / "debug"
+        self.logs_root = APP_DIR / "logs"
+        self.logs_root.mkdir(parents=True, exist_ok=True)
+        self.debug_root.mkdir(parents=True, exist_ok=True)
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.08
+
+    @property
+    def lang(self) -> str:
+        return str(self.cfg["ocr"].get("lang", "eng")) or "eng"
+
+    @property
+    def threshold(self) -> float:
+        return float(self.cfg["ocr"].get("fuzzy_threshold", 70))
+
+    def emit(self, msg: str, level: str = "info", progress: Optional[float] = None):
+        self.callback(level, msg, progress)
+        try:
+            with (self.logs_root / "execucao.log").open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} | {level.upper()} | {msg}\n")
+        except Exception:
+            pass
+
+    def _activate_remote(self):
+        if not self.cfg["remote"].get("activate_before_each_step", True):
+            return
+        title = str(self.cfg["remote"].get("window_title_contains", "")).strip()
+        if title:
+            activate_window_contains(title, wait=0.35)
+
+    def _click_point(self, key: str):
+        p = self.cfg["points"][key]
+        x, y = norm_point_to_abs(p, self.screen_size)
+        pyautogui.click(x, y)
+
+    def _is_initial_note_screen(self) -> bool:
+        found, _, _ = locate_text_on_screen(
+            ["1a tela", "1ª tela", "1 tela", "primeira tela"],
+            self.cfg["regions"]["top_detection"],
+            lang=self.lang,
+            threshold=55,
+            psm=6,
+        )
+        return found is not None
+
+    def _enter_note(self, obra: str):
+        self._activate_remote()
+        point_key = "note_field_initial" if self._is_initial_note_screen() else "note_field_detail"
+        self._click_point(point_key)
+        pyautogui.hotkey("ctrl", "a")
+        pyautogui.press("backspace")
+        pyautogui.write(str(obra), interval=float(self.cfg["automation"].get("typing_interval", 0.035)))
+        pyautogui.press("enter")
+        self.emit(f"Obra {obra}: número informado e ENTER enviado.")
+        time.sleep(float(self.cfg["timing"]["after_note_enter"]))
+
+        ok = wait_for_text(
+            ["Dados Gerais", "Dados de Campo", "Orcamento de Conexao", "Orçamento de Conexão"],
+            self.cfg["regions"]["top_detection"],
+            lang=self.lang,
+            threshold=55,
+            timeout=float(self.cfg["timing"]["screen_timeout"]),
+            poll_interval=float(self.cfg["timing"]["poll_interval"]),
+        )
+        if not ok:
+            raise RuntimeError("A tela da nota não foi reconhecida após pressionar ENTER.")
+
+    def _open_images_tab(self):
+        self._activate_remote()
+        self.emit("Abrindo Dados de Campo 2...")
+        clicked, _ = click_text(
+            ["Dados de Campo 2", "Dadosde Campo2", "DadosdeCampo2"],
+            self.cfg["regions"]["tabs"],
+            lang=self.lang,
+            threshold=55,
+        )
+        if not clicked:
+            self._click_point("dados_campo_2_fallback")
+        time.sleep(float(self.cfg["timing"]["after_tab_click"]))
+
+        self.emit("Abrindo Imagens de Campo...")
+        clicked, _ = click_text(
+            ["Imagens de Campo", "ImagensdeCampo"],
+            self.cfg["regions"]["tabs"],
+            lang=self.lang,
+            threshold=50,
+        )
+        if not clicked:
+            self._click_point("imagens_campo_fallback")
+        time.sleep(float(self.cfg["timing"]["after_tab_click"]))
+
+        links = wait_for_text(
+            ["Links", "FACHADA", "FOTO"],
+            self.cfg["regions"]["links"],
+            lang=self.lang,
+            threshold=45,
+            timeout=float(self.cfg["timing"]["screen_timeout"]),
+            poll_interval=float(self.cfg["timing"]["poll_interval"]),
+        )
+        if not links:
+            raise RuntimeError("A lista de links de Imagens de Campo não foi reconhecida.")
+
+    def _save_ocr_debug(self, obra: str, target_key: str, image: Image.Image, label: str):
+        if not self.cfg["ocr"].get("save_debug_images", True):
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
+
+    def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
+        aliases = target.get("aliases", [target.get("key", "")])
+        pages = max(1, int(self.cfg["automation"].get("scroll_pages_links", 5)))
+        scroll_amount = int(self.cfg["automation"].get("scroll_amount", -6))
+
+        # Primeiro tenta a posição atual; depois rola gradualmente para baixo.
+        for page in range(pages):
+            found, img, region_abs = locate_text_on_screen(
+                aliases,
+                self.cfg["regions"]["links"],
+                lang=self.lang,
+                threshold=self.threshold,
+                psm=6,
+            )
+            if found:
+                x, y = found.center
+                # URLs longas podem ter o alvo no fim da linha; clicar no início da linha
+                # evita acertar barras/controles à direita.
+                click_x = max(region_abs[0] + 25, found.left + min(120, max(15, found.width // 4)))
+                pyautogui.click(click_x, y)
+                self._save_ocr_debug(obra, target["key"], img, "link_encontrado")
+                return True, found.text
+
+            if page == 0:
+                self._save_ocr_debug(obra, target["key"], img, "link_nao_encontrado")
+
+            # Rola dentro da grade de links, não na página inteira.
+            cx = region_abs[0] + region_abs[2] // 2
+            cy = region_abs[1] + region_abs[3] // 2
+            pyautogui.moveTo(cx, cy)
+            pyautogui.scroll(scroll_amount)
+            time.sleep(0.7)
+
+        return False, ""
+
+    def _permit_if_needed(self):
+        time.sleep(float(self.cfg["timing"]["after_link_click"]))
+        found = wait_for_text(
+            ["Seguranca SAPGUI", "Segurança SAPGUI"],
+            self.cfg["regions"]["security_popup"],
+            lang=self.lang,
+            threshold=75,
+            timeout=4.0,
+            poll_interval=0.35,
+        )
+        if not found:
+            # Se a decisão já estiver memorizada, o popup pode não aparecer.
+            return False
+        clicked, _ = click_text(
+            ["Permitir"],
+            self.cfg["regions"]["security_popup"],
+            lang=self.lang,
+            threshold=80,
+        )
+        if not clicked:
+            self._click_point("permitir_fallback")
+        time.sleep(float(self.cfg["timing"]["after_permit"]))
+        return True
+
+    def _maximize_photo(self):
+        if not self.cfg["automation"].get("maximize_photo_window", True):
+            return
+        # O navegador está DENTRO da sessão remota. Atalhos de teclado são mais
+        # confiáveis que APIs de janelas locais.
+        pyautogui.hotkey("alt", "space")
+        time.sleep(0.25)
+        pyautogui.press("x")
+        time.sleep(float(self.cfg["timing"]["after_maximize"]))
+
+    def _capture_photo_and_coordinates(self, obra: str, target: Dict, obra_dir: Path) -> dict:
+        full = screenshot_full()
+        photo, bbox, cropped = extract_largest_photo_from_screen(
+            full,
+            self.cfg["regions"]["photo_content"],
+        )
+        result = extract_coordinates_from_photo(
+            photo,
+            lang=self.lang,
+            prefer_negative_lat=bool(self.cfg.get("ocr", {}).get("prefer_negative_latitude", True)),
+        )
+        suffix = str(target.get("output_suffix") or target.get("key") or "FOTO")
+        out_file = obra_dir / f"{obra}_{suffix}.jpg"
+        photo_rgb = photo.convert("RGB")
+        photo_rgb.save(out_file, quality=95)
+        # Mantém também o nome exato solicitado para a foto principal de fachada.
+        if "FACHADA" in str(target.get("key", "")).upper():
+            photo_rgb.save(obra_dir / f"{obra}.jpg", quality=95)
+
+        if self.cfg["ocr"].get("save_debug_images", True):
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            photo.save(self.debug_root / f"{obra}_{suffix}_foto_detectada_{stamp}.jpg", quality=90)
+            # Também salva metadados de diagnóstico do OCR.
+            meta = {
+                "bbox": bbox,
+                "cropped": cropped,
+                "latitude": result.get("latitude"),
+                "longitude": result.get("longitude"),
+                "variant": result.get("variant"),
+                "ocr_text": result.get("ocr_text", ""),
+            }
+            (self.debug_root / f"{obra}_{suffix}_ocr_{stamp}.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+        return {
+            "path": out_file,
+            "cropped": cropped,
+            **result,
+        }
+
+    def _close_photo(self):
+        if self.cfg["automation"].get("close_photo_with_alt_f4", True):
+            pyautogui.hotkey("alt", "f4")
+            time.sleep(float(self.cfg["timing"]["after_close_photo"]))
+
+    def _error_screenshot(self, obra: str, stage: str):
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            screenshot_full().save(self.logs_root / f"ERRO_{obra}_{stage}_{stamp}.png")
+        except Exception:
+            pass
+
+    def process_work(self, obra: str, work_index: int = 0, total_works: int = 1) -> dict:
+        obra = "".join(ch for ch in str(obra).strip() if ch.isdigit())
+        if not obra:
+            raise ValueError("Número de obra vazio ou inválido.")
+
+        obra_dir = self.output_root / obra
+        obra_dir.mkdir(parents=True, exist_ok=True)
+        records: list[dict] = []
+        targets = list(self.cfg["automation"].get("targets", []))
+        total_steps = max(1, total_works * (3 + len(targets) * 4))
+        base_step = work_index * (3 + len(targets) * 4)
+
+        try:
+            self.emit(f"Obra {obra}: iniciando.", progress=base_step / total_steps)
+            self._enter_note(obra)
+            self.emit(f"Obra {obra}: nota aberta.", progress=(base_step + 1) / total_steps)
+            self._open_images_tab()
+            self.emit(f"Obra {obra}: Imagens de Campo aberta.", progress=(base_step + 2) / total_steps)
+
+            for ti, target in enumerate(targets):
+                tkey = target.get("key", f"FOTO_{ti+1}")
+                step0 = base_step + 3 + ti * 4
+                self.emit(f"Obra {obra}: procurando {tkey}...", progress=step0 / total_steps)
+                found, link_text = self._locate_and_click_link(obra, target)
+                if not found:
+                    records.append({
+                        "OBRA": obra,
+                        "TIPO_FOTO": tkey,
+                        "LINK_IDENTIFICADO_OCR": "",
+                        "LATITUDE": "",
+                        "LONGITUDE": "",
+                        "ARQUIVO_FOTO": "",
+                        "STATUS_LINK": "NÃO ENCONTRADO",
+                        "STATUS_COORDENADA": "NÃO PROCESSADA",
+                        "OCR_RODAPE": "",
+                        "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    })
+                    self.emit(f"Obra {obra}: {tkey} não encontrado.", level="warning", progress=(step0 + 1) / total_steps)
+                    if not self.cfg["automation"].get("continue_when_photo_missing", True):
+                        raise RuntimeError(f"Link {tkey} não encontrado.")
+                    continue
+
+                self.emit(f"Obra {obra}: {tkey} encontrado; liberando abertura...", progress=(step0 + 1) / total_steps)
+                self._permit_if_needed()
+                self._maximize_photo()
+                self.emit(f"Obra {obra}: capturando {tkey} e lendo coordenada...", progress=(step0 + 2) / total_steps)
+                photo_result = self._capture_photo_and_coordinates(obra, target, obra_dir)
+
+                lat = photo_result.get("latitude")
+                lon = photo_result.get("longitude")
+                coord_status = "OK" if lat is not None and lon is not None else "COORDENADA NÃO RECONHECIDA"
+                records.append({
+                    "OBRA": obra,
+                    "TIPO_FOTO": tkey,
+                    "LINK_IDENTIFICADO_OCR": link_text,
+                    "LATITUDE": lat if lat is not None else "",
+                    "LONGITUDE": lon if lon is not None else "",
+                    "ARQUIVO_FOTO": str(photo_result["path"]),
+                    "STATUS_LINK": "OK",
+                    "STATUS_COORDENADA": coord_status,
+                    "OCR_RODAPE": photo_result.get("ocr_text", ""),
+                    "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                })
+                if coord_status == "OK":
+                    self.emit(f"Obra {obra}: {tkey} → {lat:.6f}, {lon:.6f}", level="success")
+                else:
+                    self.emit(f"Obra {obra}: foto {tkey} salva, mas a coordenada não foi reconhecida.", level="warning")
+                    if not self.cfg["automation"].get("continue_when_coordinate_missing", True):
+                        raise RuntimeError(f"Coordenada de {tkey} não reconhecida.")
+
+                self._close_photo()
+                self._activate_remote()
+                self.emit(f"Obra {obra}: {tkey} concluído.", progress=(step0 + 4) / total_steps)
+
+            excel_path = save_work_excel(records, obra_dir / f"{obra}_coordenadas.xlsx")
+            if self.cfg["output"].get("create_consolidated_excel", True):
+                update_consolidated(records, self.output_root / "resumo_geral.xlsx")
+
+            zip_path = None
+            if self.cfg["output"].get("create_zip", True):
+                zip_base = obra_dir.parent / f"{obra}"
+                zip_result = shutil.make_archive(str(zip_base), "zip", root_dir=obra_dir)
+                zip_path = Path(zip_result)
+
+            self.emit(f"Obra {obra}: processamento concluído.", level="success", progress=min(1.0, (base_step + 3 + len(targets) * 4) / total_steps))
+            return {
+                "obra": obra,
+                "folder": obra_dir,
+                "excel": excel_path,
+                "zip": zip_path,
+                "records": records,
+                "ok": True,
+            }
+
+        except pyautogui.FailSafeException as exc:
+            self._error_screenshot(obra, "FAILSAFE")
+            self.emit(f"Obra {obra}: execução interrompida pelo FAILSAFE (mouse no canto superior esquerdo).", level="error")
+            raise RuntimeError("Automação interrompida pelo usuário (FAILSAFE).") from exc
+        except Exception:
+            self._error_screenshot(obra, "PROCESSAMENTO")
+            raise
+
+    def process_many(self, obras: Iterable[str]) -> list[dict]:
+        obras = [str(x).strip() for x in obras if str(x).strip()]
+        results = []
+        total = len(obras)
+        for idx, obra in enumerate(obras):
+            try:
+                results.append(self.process_work(obra, idx, total))
+            except Exception as exc:
+                self.emit(f"Obra {obra}: ERRO - {exc}", level="error")
+                results.append({"obra": obra, "ok": False, "error": str(exc), "records": []})
+        return results

@@ -1,0 +1,27 @@
+SAP FOTOS - EXE SEM INSTALACAO
+==============================
+
+O pacote foi preparado para gerar:
+  1) SAP_Fotos.exe              -> arquivo unico
+  2) SAP_Fotos_Portatil.zip     -> pasta portatil, recomendada
+
+O Tesseract OCR fica EMBUTIDO no build. O notebook de uso nao precisa instalar
+Python, Streamlit, OpenCV, Tesseract ou as demais bibliotecas.
+
+RECOMENDADO:
+- gerar o EXE pelo GitHub Actions (.github/workflows/build-windows-exe.yml);
+- baixar o artefato SAP-Fotos-Windows;
+- levar para o notebook apenas se a politica da empresa permitir.
+
+NO NOTEBOOK:
+1. deixe RDP aberto;
+2. deixe SAP aberto;
+3. execute o EXE;
+4. calibre os pontos na primeira execucao;
+5. teste uma obra antes de rodar varias.
+
+Arquivos/resultados ficam em:
+  %LOCALAPPDATA%\SAP_Fotos\
+
+Se AppLocker, Defender, SmartScreen ou outra politica bloquear o programa,
+nao tente contornar a protecao; solicite liberacao/assinatura para a TI.
