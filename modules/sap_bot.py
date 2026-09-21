@@ -17,6 +17,7 @@ from .vision import (
     extract_coordinates_from_photo,
     extract_largest_photo_from_screen,
     locate_text_on_screen,
+    locate_link_filename_on_screen,
     save_debug_image,
     wait_for_text,
 )
@@ -24,10 +25,43 @@ from .window_control import (
     activate_window_contains,
     maximize_window_contains,
     norm_point_in_window_to_abs,
+    get_window_region_contains,
     screenshot_window_contains,
 )
 
 ProgressCallback = Callable[[str, str, Optional[float]], None]
+
+
+# Fotos obrigatorias deste fluxo. Nao dependem mais do config.json.
+FIXED_TARGETS = [
+    {
+        "key": "FACHADADOIMOVEL",
+        "aliases": [
+            "FACHADADOIMOVEL",
+            "FACHADAIMOVEL",
+            "FACHADADOIMOVEL.JPG",
+            "FACHADAIMOVEL.JPG",
+        ],
+        "output_suffix": "FACHADADOIMOVEL",
+    },
+    {
+        "key": "ADESIVOLIGACAONOVA",
+        "aliases": [
+            "ADESIVOLIGACAONOVA",
+            "ADESIVOLIGACAONOVA.JPG",
+        ],
+        "output_suffix": "ADESIVOLIGACAONOVA",
+    },
+    {
+        "key": "FOTOPANORAMICA",
+        "aliases": [
+            "FOTOPANORAMICA",
+            "FOTOPANORAMICA.JPG",
+            "FOTO PANORAMICA",
+        ],
+        "output_suffix": "FOTOPANORAMICA",
+    },
+]
 
 
 class SAPPhotoBot:
@@ -267,63 +301,52 @@ class SAPPhotoBot:
         save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
 
     def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
-        """Procura o arquivo exclusivamente na grade do SAP dentro do RDP.
+        """Localiza o nome do JPG e clica na mesma linha do hyperlink.
 
-        A região é propositalmente mais ampla que a configuração original,
-        porque em RDP redimensionado a tabela pode subir/descer alguns pixels.
-        Também tenta PSM 6 e PSM 11 e usa limiar menor para os links pequenos.
+        O OCR e feito SOMENTE na parte direita da grade, onde aparecem os nomes
+        FACHADADOIMOVEL / ADESIVOLIGACAONOVA / FOTOPANORAMICA. Depois de achar
+        a linha, o clique e feito na parte esquerda da MESMA linha, sobre a URL.
         """
         aliases = target.get("aliases", [target.get("key", "")])
-        pages = max(1, int(self.cfg.get("automation", {}).get("scroll_pages_links", 5)))
-        scroll_amount = int(self.cfg.get("automation", {}).get("scroll_amount", -6))
+        pages = max(1, int(self.cfg.get("automation", {}).get("scroll_pages_links", 4)))
 
         self._activate_remote()
 
-        # Região relativa somente à janela RDP. No layout mostrado pelo SAP,
-        # engloba o título "Links" e toda a grade de URLs.
-        # Grade real de links na tela maximizada. Evita capturar abas e outros textos.
-        region_links = [0.015, 0.275, 0.62, 0.36]
-        threshold = min(float(self.threshold), 44.0)
+        # Faixa onde os nomes dos arquivos aparecem na grade em RDP maximizado.
+        # Evita OCR no prefixo enorme da URL e melhora muito a leitura.
+        filename_region = [0.20, 0.25, 0.43, 0.36]
+
+        # Garante que a grade esteja no topo antes de procurar cada foto.
+        win_left, win_top, win_w, win_h = get_window_region_contains(
+            self.remote_title,
+            content_only=False,
+        )
+        grid_x = win_left + int(win_w * 0.30)
+        grid_y = win_top + int(win_h * 0.42)
+        pyautogui.moveTo(grid_x, grid_y)
+        pyautogui.scroll(20)
+        time.sleep(0.5)
 
         last_img = None
-        last_region = None
 
         for page in range(pages):
-            found = None
-            img = None
-            region_abs = None
+            found, img, region_abs = locate_link_filename_on_screen(
+                aliases,
+                filename_region,
+                lang=self.lang,
+                threshold=58,
+                window_title=self.remote_title,
+            )
+            last_img = img
 
-            # PSM 6 funciona bem para tabela; PSM 11 ajuda quando o texto
-            # aparece espaçado/fragmentado por causa da escala do RDP.
-            for psm in (6, 11):
-                found, img, region_abs = locate_text_on_screen(
-                    aliases,
-                    region_links,
-                    lang=self.lang,
-                    threshold=threshold,
-                    psm=psm,
-                    window_title=self.remote_title,
-                )
+            if found:
+                # O hyperlink ocupa a linha inteira. Clica mais a esquerda, onde a
+                # URL e certamente clicavel, mantendo exatamente o Y reconhecido.
+                click_x = win_left + int(win_w * 0.10)
+                click_y = found.center[1]
 
-                last_img = img
-                last_region = region_abs
-
-                if found:
-                    break
-
-            if found and region_abs:
-                _, y = found.center
-
-                # Clica no começo da URL, onde o hyperlink é mais estável.
-                click_x = max(
-                    region_abs[0] + 20,
-                    min(
-                        found.left + 100,
-                        region_abs[0] + region_abs[2] - 20,
-                    ),
-                )
-
-                pyautogui.click(click_x, y)
+                pyautogui.moveTo(click_x, click_y, duration=0.20)
+                pyautogui.click()
 
                 self._save_ocr_debug(
                     obra,
@@ -332,6 +355,10 @@ class SAPPhotoBot:
                     "link_encontrado",
                 )
 
+                self.emit(
+                    f"Obra {obra}: {target.get('key', 'FOTO')} localizado na grade.",
+                    level="success",
+                )
                 return True, found.text
 
             if page == 0 and last_img is not None:
@@ -342,43 +369,41 @@ class SAPPhotoBot:
                     "link_nao_encontrado",
                 )
 
-            if last_region:
-                cx = last_region[0] + last_region[2] // 2
-                cy = last_region[1] + last_region[3] // 2
-                pyautogui.moveTo(cx, cy)
-                pyautogui.scroll(scroll_amount)
-                time.sleep(0.7)
+            # Rola somente dentro da grade para procurar linhas abaixo.
+            pyautogui.moveTo(grid_x, grid_y)
+            pyautogui.scroll(-6)
+            time.sleep(0.65)
 
         return False, ""
 
     def _permit_if_needed(self):
-        time.sleep(float(self.cfg["timing"]["after_link_click"]))
+        """Libera o popup Segurança SAPGUI.
 
-        # O popup pertence ao SAP remoto; OCR somente dentro do RDP.
-        found = wait_for_text(
-            ["Seguranca SAPGUI", "Segurança SAPGUI"],
-            self.cfg["regions"]["security_popup"],
-            lang=self.lang,
-            threshold=75,
-            timeout=4.0,
-            poll_interval=0.35,
-            window_title=self.remote_title,
-        )
-        if not found:
-            # Se o SAP já memorizou a decisão, o popup pode não aparecer.
-            return False
+        Primeiro tenta OCR do botao Permitir. Se o OCR falhar, usa um ponto
+        normalizado conhecido do popup. Se a decisao ja estiver memorizada e o
+        navegador tiver aberto direto, o clique de fallback cai em uma area
+        inofensiva da pagina da foto.
+        """
+        time.sleep(max(1.0, float(self.cfg.get("timing", {}).get("after_link_click", 1.0))))
 
         clicked, _ = click_text(
             ["Permitir"],
-            self.cfg["regions"]["security_popup"],
+            [0.20, 0.28, 0.50, 0.36],
             lang=self.lang,
-            threshold=80,
+            threshold=45,
             window_title=self.remote_title,
         )
-        if not clicked:
-            self._click_point("permitir_fallback")
 
-        time.sleep(float(self.cfg["timing"]["after_permit"]))
+        if not clicked:
+            # Ponto do botao Permitir medido nos prints fornecidos.
+            x, y = norm_point_in_window_to_abs(
+                self.remote_title,
+                (0.357, 0.548),
+                content_only=False,
+            )
+            pyautogui.click(x, y)
+
+        time.sleep(max(2.5, float(self.cfg.get("timing", {}).get("after_permit", 2.0))))
         return True
 
     def _maximize_photo(self):
@@ -392,18 +417,23 @@ class SAPPhotoBot:
         time.sleep(float(self.cfg["timing"]["after_maximize"]))
 
     def _capture_photo_and_coordinates(self, obra: str, target: Dict, obra_dir: Path) -> dict:
-        """Captura e analisa somente o conteúdo visível da janela RDP."""
+        """Tira o print da foto, salva o JPG e extrai latitude/longitude."""
+        # Aguarda a imagem terminar de carregar no navegador remoto.
+        time.sleep(1.5)
+
         remote_screen, remote_abs_region = screenshot_window_contains(
             self.remote_title,
             content_only=False,
         )
 
+        # Regiao ampla do navegador. Funciona tanto com navegador maximizado
+        # quanto com a janela aberta sobre o SAP.
         photo, bbox_local, cropped = extract_largest_photo_from_screen(
             remote_screen,
-            self.cfg["regions"]["photo_content"],
+            [0.00, 0.04, 1.00, 0.92],
+            min_area_ratio=0.01,
         )
 
-        # Converte bbox relativo ao print do RDP para coordenada absoluta apenas para diagnóstico.
         bbox_abs = (
             remote_abs_region[0] + bbox_local[0],
             remote_abs_region[1] + bbox_local[1],
@@ -414,21 +444,52 @@ class SAPPhotoBot:
         result = extract_coordinates_from_photo(
             photo,
             lang=self.lang,
-            prefer_negative_lat=bool(self.cfg.get("ocr", {}).get("prefer_negative_latitude", True)),
+            prefer_negative_lat=bool(
+                self.cfg.get("ocr", {}).get("prefer_negative_latitude", True)
+            ),
         )
+
+        # Fallback de coordenada: se o recorte principal nao trouxe o carimbo,
+        # tenta uma area grande da metade esquerda do navegador, onde a foto abre.
+        if result.get("latitude") is None or result.get("longitude") is None:
+            rw, rh = remote_screen.size
+            fallback_photo = remote_screen.crop(
+                (0, int(rh * 0.04), int(rw * 0.65), int(rh * 0.96))
+            )
+            fallback_result = extract_coordinates_from_photo(
+                fallback_photo,
+                lang=self.lang,
+                prefer_negative_lat=bool(
+                    self.cfg.get("ocr", {}).get("prefer_negative_latitude", True)
+                ),
+            )
+            if (
+                fallback_result.get("latitude") is not None
+                and fallback_result.get("longitude") is not None
+            ):
+                result = fallback_result
 
         suffix = str(target.get("output_suffix") or target.get("key") or "FOTO")
         out_file = obra_dir / f"{obra}_{suffix}.jpg"
+
+        # Este e o print da FOTO solicitado pelo usuario.
         photo_rgb = photo.convert("RGB")
         photo_rgb.save(out_file, quality=95)
 
-        # Mantém também o nome simples da fachada solicitado originalmente.
+        # A fachada tambem fica com o nome simples NUMERO_DA_OBRA.jpg.
         if "FACHADA" in str(target.get("key", "")).upper():
             photo_rgb.save(obra_dir / f"{obra}.jpg", quality=95)
 
         if self.cfg.get("ocr", {}).get("save_debug_images", True):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            photo.save(self.debug_root / f"{obra}_{suffix}_foto_detectada_{stamp}.jpg", quality=90)
+            remote_screen.convert("RGB").save(
+                self.debug_root / f"{obra}_{suffix}_tela_completa_{stamp}.jpg",
+                quality=85,
+            )
+            photo_rgb.save(
+                self.debug_root / f"{obra}_{suffix}_foto_detectada_{stamp}.jpg",
+                quality=90,
+            )
             meta = {
                 "remote_window": self.remote_title,
                 "remote_region_abs": remote_abs_region,
@@ -474,7 +535,7 @@ class SAPPhotoBot:
         obra_dir = self.output_root / obra
         obra_dir.mkdir(parents=True, exist_ok=True)
         records: list[dict] = []
-        targets = list(self.cfg.get("automation", {}).get("targets", []))
+        targets = [dict(item) for item in FIXED_TARGETS]
         total_steps = max(1, total_works * (3 + len(targets) * 4))
         base_step = work_index * (3 + len(targets) * 4)
 
