@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 from rapidfuzz import fuzz
 
 from .config import norm_region_to_abs
@@ -313,6 +313,121 @@ def click_text(
     pyautogui.click(x + click_offset[0], y + click_offset[1])
     return True, found.text
 
+
+
+def locate_link_filename_on_screen(
+    targets: Sequence[str],
+    region_norm: Iterable[float],
+    *,
+    lang: str = "eng",
+    threshold: float = 62,
+    window_title: str = "",
+) -> tuple[Optional[OCRLine], Image.Image, tuple[int, int, int, int]]:
+    """Localiza o NOME DO ARQUIVO dentro da grade de links do SAP.
+
+    Esta rotina e mais agressiva do que o OCR generico porque os links do SAP
+    ficam com fonte muito pequena. Ela:
+      1) captura somente a faixa onde ficam os nomes dos JPGs;
+      2) amplia a imagem;
+      3) aumenta o contraste;
+      4) testa mais de uma binarizacao/PSM;
+      5) compara a linha inteira com os aliases informados.
+
+    O retorno usa coordenadas absolutas do monitor, mas a captura continua
+    restrita a janela RDP.
+    """
+    image, region_abs = screenshot_norm_region(
+        region_norm,
+        window_title=window_title,
+    )
+
+    # Upscale forte: em RDP 1920x1080 essa faixa ainda tem fonte muito pequena.
+    scale = 3.0 if image.width < 1000 else 2.4
+
+    gray = ImageOps.grayscale(image)
+    gray = ImageEnhance.Contrast(gray).enhance(2.2)
+    big = gray.resize(
+        (
+            max(1, int(round(gray.width * scale))),
+            max(1, int(round(gray.height * scale))),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+
+    arr = np.array(big)
+    # Duas variantes adicionais melhoram links sublinhados/azuis do SAP.
+    _, bw180 = cv2.threshold(arr, 180, 255, cv2.THRESH_BINARY)
+    _, bw205 = cv2.threshold(arr, 205, 255, cv2.THRESH_BINARY)
+
+    variants = [
+        ("gray", big),
+        ("bw180", Image.fromarray(bw180)),
+        ("bw205", Image.fromarray(bw205)),
+    ]
+
+    norm_targets = [normalize_text(t) for t in targets if str(t).strip()]
+    best: Optional[OCRLine] = None
+    best_score = -1.0
+
+    for _, variant in variants:
+        for psm in (6, 11, 12):
+            df = _image_to_data(variant, lang=lang, psm=psm)
+            if df.empty:
+                continue
+
+            keys = ["block_num", "par_num", "line_num"]
+            for _, grp in df.groupby(keys, sort=False):
+                words = [
+                    str(t).strip()
+                    for t in grp["text"].tolist()
+                    if str(t).strip()
+                ]
+                if not words:
+                    continue
+
+                line_text = " ".join(words)
+                line_norm = normalize_text(line_text)
+                if not line_norm:
+                    continue
+
+                score = -1.0
+                for target_norm in norm_targets:
+                    if not target_norm:
+                        continue
+                    if target_norm in line_norm:
+                        score = max(score, 100.0)
+                    else:
+                        score = max(
+                            score,
+                            float(fuzz.partial_ratio(target_norm, line_norm)),
+                            float(fuzz.ratio(target_norm, line_norm)),
+                        )
+
+                if score < threshold or score <= best_score:
+                    continue
+
+                left = int(grp["left"].min())
+                top = int(grp["top"].min())
+                right = int((grp["left"] + grp["width"]).max())
+                bottom = int((grp["top"] + grp["height"]).max())
+
+                # Volta da imagem ampliada para o tamanho real da captura.
+                left = int(round(left / scale))
+                top = int(round(top / scale))
+                right = int(round(right / scale))
+                bottom = int(round(bottom / scale))
+
+                best_score = float(score)
+                best = OCRLine(
+                    line_text,
+                    region_abs[0] + left,
+                    region_abs[1] + top,
+                    max(1, right - left),
+                    max(1, bottom - top),
+                    float(score),
+                )
+
+    return best, image, region_abs
 
 def _normalize_ocr_coord_text(text: str) -> str:
     s = str(text or "")
