@@ -22,6 +22,7 @@ from .vision import (
 )
 from .window_control import (
     activate_window_contains,
+    maximize_window_contains,
     norm_point_in_window_to_abs,
     screenshot_window_contains,
 )
@@ -67,6 +68,17 @@ class SAPPhotoBot:
         if not self.remote_title:
             raise RuntimeError("O título da Área Remota não está configurado.")
         return activate_window_contains(self.remote_title, wait=0.35)
+
+    def _prepare_remote_for_automation(self):
+        """Coloca o RDP em tela maximizada antes de qualquer clique no SAP.
+
+        O SAP reorganiza e redimensiona os controles quando a janela RDP fica em
+        meia tela. Por isso o robo maximiza a janela local do RDP e so entao usa
+        os pontos normalizados calibrados para a tela cheia.
+        """
+        self.emit("Preparando Área Remota em tela maximizada...")
+        maximize_window_contains(self.remote_title, wait=1.2, timeout=6.0)
+        self._activate_remote()
 
     def _click_point(self, key: str):
         """Clica em um ponto normalizado RELATIVO À JANELA RDP."""
@@ -173,133 +185,65 @@ class SAPPhotoBot:
         )
 
     def _open_images_tab(self):
-        """
-        Abre Dados de Campo 2 e depois Imagens de Campo.
+        """Abre obrigatoriamente Dados de Campo 2 e depois Imagens de Campo.
 
-        Todo OCR e todos os cliques permanecem restritos
-        à janela da Área Remota.
+        Para essas duas abas NAO dependemos de OCR. O layout do SAP mostrado pelo
+        usuario e fixo quando o RDP esta maximizado; portanto usamos os pontos
+        calibrados diretamente. Depois, o OCR e usado somente para localizar os
+        arquivos FACHADA/ADESIVO/PANORAMICA dentro da grade de links.
         """
         self._activate_remote()
 
-        # ========================================================
-        # 1. DADOS DE CAMPO 2
-        # ========================================================
-        self.emit("Abrindo Dados de Campo 2...")
-
-        region_abas_principais = [0.00, 0.05, 0.85, 0.22]
-
-        clicked, texto = click_text(
-            [
-                "Dados de Campo 2",
-                "Dados de Campo2",
-                "Dadosde Campo2",
-                "DadosdeCampo2",
-                "Dados Campo 2",
-            ],
-            region_abas_principais,
-            lang=self.lang,
-            threshold=42,
-            window_title=self.remote_title,
-        )
-
-        if clicked:
-            self.emit(f"Dados de Campo 2 localizado pelo OCR: {texto}")
-        else:
-            self.emit(
-                "OCR não localizou Dados de Campo 2. Utilizando ponto de fallback.",
-                level="warning",
-            )
+        # 1) DADOS DE CAMPO 2
+        self.emit("Clicando em Dados de Campo 2...")
+        try:
             self._click_point("dados_campo_2_fallback")
-
-        time.sleep(
-            max(
-                1.0,
-                float(self.cfg.get("timing", {}).get("after_tab_click", 1.5)),
+        except Exception:
+            # Coordenada de referencia obtida na tela SAP maximizada enviada.
+            x, y = norm_point_in_window_to_abs(
+                self.remote_title,
+                (0.317, 0.197),
+                content_only=False,
             )
-        )
+            pyautogui.click(x, y)
 
-        # ========================================================
-        # 2. IMAGENS DE CAMPO
-        # ========================================================
-        self.emit("Abrindo Imagens de Campo...")
+        time.sleep(max(1.3, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
 
-        region_subabas = [0.00, 0.12, 0.85, 0.20]
+        # 2) IMAGENS DE CAMPO
+        self.emit("Clicando em Imagens de Campo...")
+        try:
+            self._click_point("imagens_campo_fallback")
+        except Exception:
+            # Coordenada de referencia obtida na tela SAP maximizada enviada.
+            x, y = norm_point_in_window_to_abs(
+                self.remote_title,
+                (0.292, 0.243),
+                content_only=False,
+            )
+            pyautogui.click(x, y)
 
-        clicked, texto = click_text(
-            [
-                "Imagens de Campo",
-                "Imagens Campo",
-                "ImagensdeCampo",
-                "Imagem de Campo",
-            ],
-            region_subabas,
+        time.sleep(max(1.5, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
+
+        # 3) Confirmacao apenas informativa. Nao aborta a automacao se o OCR nao
+        # conseguir ler a palavra Links; a busca dos JPGs e a validacao real.
+        links = wait_for_text(
+            ["Links", "FACHADA", "ADESIVO", "PANORAMICA", "JPG"],
+            [0.00, 0.20, 0.72, 0.55],
             lang=self.lang,
-            threshold=40,
+            threshold=35,
+            timeout=4.0,
+            poll_interval=0.35,
             window_title=self.remote_title,
         )
 
-        if clicked:
-            self.emit(f"Imagens de Campo localizada pelo OCR: {texto}")
+        if links:
+            self.emit("Imagens de Campo aberta; grade de links detectada.")
         else:
             self.emit(
-                "OCR não localizou Imagens de Campo. Utilizando ponto de fallback.",
+                "Imagens de Campo foi clicada. O OCR ainda nao confirmou a grade; "
+                "seguindo para procurar diretamente os tres arquivos solicitados.",
                 level="warning",
             )
-            self._click_point("imagens_campo_fallback")
-
-        time.sleep(
-            max(
-                1.0,
-                float(self.cfg.get("timing", {}).get("after_tab_click", 1.5)),
-            )
-        )
-
-        # ========================================================
-        # 3. CONFIRMAR QUE A TELA DE LINKS ABRIU
-        # ========================================================
-        region_links_ampla = [0.00, 0.18, 0.75, 0.62]
-
-        links = wait_for_text(
-            [
-                "Links",
-                "FACHADA",
-                "FOTO",
-                "ADESIVO",
-                ".jpg",
-                ".JPG",
-            ],
-            region_links_ampla,
-            lang=self.lang,
-            threshold=38,
-            timeout=float(self.cfg.get("timing", {}).get("screen_timeout", 8.0)),
-            poll_interval=float(self.cfg.get("timing", {}).get("poll_interval", 0.45)),
-            window_title=self.remote_title,
-        )
-
-        if not links:
-            # Pela navegação de fallback a aba pode estar corretamente aberta
-            # mesmo quando o OCR não consegue ler a fonte pequena do SAP.
-            # Não aborta aqui: a busca do arquivo-alvo abaixo é a validação real.
-            try:
-                img, _ = screenshot_window_contains(
-                    self.remote_title,
-                    content_only=False,
-                )
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                img.save(
-                    self.debug_root / f"tela_imagens_campo_{stamp}.png"
-                )
-            except Exception:
-                pass
-
-            self.emit(
-                "A aba Imagens de Campo foi aberta, mas o OCR não conseguiu "
-                "confirmar os textos da grade. Continuando para a busca dos links...",
-                level="warning",
-            )
-            return
-
-        self.emit("Tela de Imagens de Campo reconhecida.")
 
     def _save_ocr_debug(self, obra: str, target_key: str, image: Image.Image, label: str):
         if not self.cfg.get("ocr", {}).get("save_debug_images", True):
@@ -322,8 +266,9 @@ class SAPPhotoBot:
 
         # Região relativa somente à janela RDP. No layout mostrado pelo SAP,
         # engloba o título "Links" e toda a grade de URLs.
-        region_links = [0.00, 0.15, 0.76, 0.64]
-        threshold = min(float(self.threshold), 50.0)
+        # Grade real de links na tela maximizada. Evita capturar abas e outros textos.
+        region_links = [0.015, 0.275, 0.62, 0.36]
+        threshold = min(float(self.threshold), 44.0)
 
         last_img = None
         last_region = None
@@ -520,6 +465,7 @@ class SAPPhotoBot:
 
         try:
             self.emit(f"Obra {obra}: iniciando.", progress=base_step / total_steps)
+            self._prepare_remote_for_automation()
             self._enter_note(obra)
             self.emit(f"Obra {obra}: nota aberta.", progress=(base_step + 1) / total_steps)
             self._open_images_tab()
