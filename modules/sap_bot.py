@@ -277,6 +277,9 @@ class SAPPhotoBot:
         )
 
         if not links:
+            # Pela navegação de fallback a aba pode estar corretamente aberta
+            # mesmo quando o OCR não consegue ler a fonte pequena do SAP.
+            # Não aborta aqui: a busca do arquivo-alvo abaixo é a validação real.
             try:
                 img, _ = screenshot_window_contains(
                     self.remote_title,
@@ -289,10 +292,12 @@ class SAPPhotoBot:
             except Exception:
                 pass
 
-            raise RuntimeError(
-                "Dados de Campo 2 foi acessado, mas a tela de Imagens de Campo "
-                "não pôde ser confirmada."
+            self.emit(
+                "A aba Imagens de Campo foi aberta, mas o OCR não conseguiu "
+                "confirmar os textos da grade. Continuando para a busca dos links...",
+                level="warning",
             )
+            return
 
         self.emit("Tela de Imagens de Campo reconhecida.")
 
@@ -303,42 +308,86 @@ class SAPPhotoBot:
         save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
 
     def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
-        """Procura o link exclusivamente dentro da grade do SAP no RDP."""
+        """Procura o arquivo exclusivamente na grade do SAP dentro do RDP.
+
+        A região é propositalmente mais ampla que a configuração original,
+        porque em RDP redimensionado a tabela pode subir/descer alguns pixels.
+        Também tenta PSM 6 e PSM 11 e usa limiar menor para os links pequenos.
+        """
         aliases = target.get("aliases", [target.get("key", "")])
         pages = max(1, int(self.cfg.get("automation", {}).get("scroll_pages_links", 5)))
         scroll_amount = int(self.cfg.get("automation", {}).get("scroll_amount", -6))
 
         self._activate_remote()
 
+        # Região relativa somente à janela RDP. No layout mostrado pelo SAP,
+        # engloba o título "Links" e toda a grade de URLs.
+        region_links = [0.00, 0.15, 0.76, 0.64]
+        threshold = min(float(self.threshold), 50.0)
+
+        last_img = None
+        last_region = None
+
         for page in range(pages):
-            found, img, region_abs = locate_text_on_screen(
-                aliases,
-                self.cfg["regions"]["links"],
-                lang=self.lang,
-                threshold=self.threshold,
-                psm=6,
-                window_title=self.remote_title,
-            )
-            if found:
-                _, y = found.center
-                # Para URL longa, clicar mais perto do começo da linha é mais seguro.
-                click_x = max(
-                    region_abs[0] + 25,
-                    found.left + min(120, max(15, found.width // 4)),
+            found = None
+            img = None
+            region_abs = None
+
+            # PSM 6 funciona bem para tabela; PSM 11 ajuda quando o texto
+            # aparece espaçado/fragmentado por causa da escala do RDP.
+            for psm in (6, 11):
+                found, img, region_abs = locate_text_on_screen(
+                    aliases,
+                    region_links,
+                    lang=self.lang,
+                    threshold=threshold,
+                    psm=psm,
+                    window_title=self.remote_title,
                 )
+
+                last_img = img
+                last_region = region_abs
+
+                if found:
+                    break
+
+            if found and region_abs:
+                _, y = found.center
+
+                # Clica no começo da URL, onde o hyperlink é mais estável.
+                click_x = max(
+                    region_abs[0] + 20,
+                    min(
+                        found.left + 100,
+                        region_abs[0] + region_abs[2] - 20,
+                    ),
+                )
+
                 pyautogui.click(click_x, y)
-                self._save_ocr_debug(obra, target.get("key", "FOTO"), img, "link_encontrado")
+
+                self._save_ocr_debug(
+                    obra,
+                    target.get("key", "FOTO"),
+                    img,
+                    "link_encontrado",
+                )
+
                 return True, found.text
 
-            if page == 0:
-                self._save_ocr_debug(obra, target.get("key", "FOTO"), img, "link_nao_encontrado")
+            if page == 0 and last_img is not None:
+                self._save_ocr_debug(
+                    obra,
+                    target.get("key", "FOTO"),
+                    last_img,
+                    "link_nao_encontrado",
+                )
 
-            # A rolagem também fica restrita à área da grade remota.
-            cx = region_abs[0] + region_abs[2] // 2
-            cy = region_abs[1] + region_abs[3] // 2
-            pyautogui.moveTo(cx, cy)
-            pyautogui.scroll(scroll_amount)
-            time.sleep(0.7)
+            if last_region:
+                cx = last_region[0] + last_region[2] // 2
+                cy = last_region[1] + last_region[3] // 2
+                pyautogui.moveTo(cx, cy)
+                pyautogui.scroll(scroll_amount)
+                time.sleep(0.7)
 
         return False, ""
 
