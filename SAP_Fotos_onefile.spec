@@ -44,8 +44,9 @@ for package_name in ["streamlit", "altair", "pydeck"]:
 
 # Tesseract portátil completo. O workflow de build preenche esta pasta.
 tess_dir = project / "vendor" / "tesseract"
+
 if tess_dir.exists() and (tess_dir / "tesseract.exe").exists():
-    datas += Tree(str(tess_dir), prefix="tesseract")
+    datas.append((str(tess_dir), "tesseract"))
 
 
 a = Analysis(
