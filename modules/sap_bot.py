@@ -185,53 +185,68 @@ class SAPPhotoBot:
         )
 
     def _open_images_tab(self):
-        """Abre obrigatoriamente Dados de Campo 2 e depois Imagens de Campo.
+        """Abre Dados de Campo 2 e, obrigatoriamente, Imagens de Campo.
 
-        Para essas duas abas NAO dependemos de OCR. O layout do SAP mostrado pelo
-        usuario e fixo quando o RDP esta maximizado; portanto usamos os pontos
-        calibrados diretamente. Depois, o OCR e usado somente para localizar os
-        arquivos FACHADA/ADESIVO/PANORAMICA dentro da grade de links.
+        IMPORTANTE:
+        Nesta versao os dois cliques NAO usam mais os pontos antigos do
+        config.json. O bug anterior acontecia porque o config continha uma
+        coordenada antiga para ``imagens_campo_fallback``; como a chave existia,
+        o codigo nunca chegava ao ponto fixo correto.
+
+        Os pontos abaixo sao relativos a janela RDP maximizada e foram obtidos
+        diretamente das telas SAP enviadas pelo usuario.
         """
         self._activate_remote()
 
+        # --------------------------------------------------------
         # 1) DADOS DE CAMPO 2
+        # --------------------------------------------------------
         self.emit("Clicando em Dados de Campo 2...")
-        try:
-            self._click_point("dados_campo_2_fallback")
-        except Exception:
-            # Coordenada de referencia obtida na tela SAP maximizada enviada.
-            x, y = norm_point_in_window_to_abs(
-                self.remote_title,
-                (0.317, 0.197),
-                content_only=False,
-            )
-            pyautogui.click(x, y)
 
-        time.sleep(max(1.3, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
+        x, y = norm_point_in_window_to_abs(
+            self.remote_title,
+            (0.317, 0.197),
+            content_only=False,
+        )
+        pyautogui.moveTo(x, y, duration=0.20)
+        pyautogui.click()
 
+        # O SAP precisa de um pequeno tempo para montar as subabas.
+        time.sleep(max(1.8, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
+
+        # --------------------------------------------------------
         # 2) IMAGENS DE CAMPO
+        # --------------------------------------------------------
         self.emit("Clicando em Imagens de Campo...")
-        try:
-            self._click_point("imagens_campo_fallback")
-        except Exception:
-            # Coordenada de referencia obtida na tela SAP maximizada enviada.
-            x, y = norm_point_in_window_to_abs(
-                self.remote_title,
-                (0.292, 0.243),
-                content_only=False,
-            )
-            pyautogui.click(x, y)
 
-        time.sleep(max(1.5, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
+        # Ponto fixo da subaba Imagens de Campo na sessao RDP maximizada.
+        x, y = norm_point_in_window_to_abs(
+            self.remote_title,
+            (0.292, 0.243),
+            content_only=False,
+        )
+        pyautogui.moveTo(x, y, duration=0.20)
+        pyautogui.click()
 
-        # 3) Confirmacao apenas informativa. Nao aborta a automacao se o OCR nao
-        # conseguir ler a palavra Links; a busca dos JPGs e a validacao real.
+        # Segunda tentativa no mesmo ponto caso o primeiro clique ocorra durante
+        # a atualizacao visual do SAP. Nao e doubleClick; sao dois cliques com
+        # intervalo para evitar abrir controles indevidos.
+        time.sleep(0.55)
+        pyautogui.click(x, y)
+
+        time.sleep(max(2.0, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
+
+        # --------------------------------------------------------
+        # 3) VALIDACAO DA GRADE DE LINKS
+        # --------------------------------------------------------
+        # Essa validacao e informativa. A busca dos JPGs logo depois e a
+        # validacao real, entao o fluxo nao e abortado se o OCR falhar aqui.
         links = wait_for_text(
             ["Links", "FACHADA", "ADESIVO", "PANORAMICA", "JPG"],
             [0.00, 0.20, 0.72, 0.55],
             lang=self.lang,
-            threshold=35,
-            timeout=4.0,
+            threshold=32,
+            timeout=5.0,
             poll_interval=0.35,
             window_title=self.remote_title,
         )
@@ -240,8 +255,8 @@ class SAPPhotoBot:
             self.emit("Imagens de Campo aberta; grade de links detectada.")
         else:
             self.emit(
-                "Imagens de Campo foi clicada. O OCR ainda nao confirmou a grade; "
-                "seguindo para procurar diretamente os tres arquivos solicitados.",
+                "Imagens de Campo foi clicada. O OCR nao confirmou a grade, "
+                "mas o robo seguira para procurar diretamente os tres JPGs.",
                 level="warning",
             )
 
