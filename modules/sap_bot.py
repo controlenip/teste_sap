@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import ctypes
 import json
+import re
 import shutil
 import time
+import webbrowser
+from ctypes import wintypes
+from io import BytesIO
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
@@ -31,9 +39,66 @@ from .window_control import (
     norm_point_in_window_to_abs,
     get_window_region_contains,
     screenshot_window_contains,
+    active_window_title,
 )
 
 ProgressCallback = Callable[[str, str, Optional[float]], None]
+
+
+# ---------------------------------------------------------------------------
+# Clipboard do Windows
+# ---------------------------------------------------------------------------
+# A Area de Trabalho Remota precisa estar com o redirecionamento de clipboard
+# habilitado. Assim, o Ctrl+C feito dentro do SAP chega ao clipboard do PC local.
+CF_UNICODETEXT = 13
+
+
+def _clear_windows_clipboard() -> None:
+    user32 = ctypes.windll.user32
+    if user32.OpenClipboard(None):
+        try:
+            user32.EmptyClipboard()
+        finally:
+            user32.CloseClipboard()
+
+
+def _read_windows_clipboard_text() -> str:
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+
+    if not user32.OpenClipboard(None):
+        return ""
+
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def _extract_jpg_url(text: str) -> str:
+    """Extrai um endereco HTTP/HTTPS terminado em .jpg do texto copiado."""
+    raw = str(text or "").replace("\r", " ").replace("\n", " ").strip()
+    if not raw:
+        return ""
+    match = re.search(r"https?://.*?\.jpg", raw, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(0).strip().strip('"').strip("'")
 
 
 # Fotos obrigatorias deste fluxo. Nao dependem mais do config.json.
@@ -304,235 +369,194 @@ class SAPPhotoBot:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
 
-    def _dismiss_security_popup(self) -> None:
-        """Fecha o popup Segurança SAPGUI quando o link nao e o desejado."""
-        popup_region = [0.18, 0.30, 0.62, 0.36]
+    def _copy_url_from_link_row(
+        self,
+        y_abs: int,
+        grid_region_abs: tuple[int, int, int, int],
+    ) -> str:
+        """Copia uma URL da grade SAP sem abrir o link.
 
-        clicked, _ = click_text(
-            ["Rejeitar"],
-            popup_region,
-            lang=self.lang,
-            threshold=40,
-            window_title=self.remote_title,
-        )
+        Usa o modo de selecao em bloco do SAP GUI (Ctrl+Y), arrasta somente a
+        linha desejada e envia Ctrl+C. Com o clipboard redirecionado pelo RDP,
+        o texto passa a ficar disponivel no Windows local.
+        """
+        self._activate_remote()
+        _clear_windows_clipboard()
 
-        if not clicked:
-            # Ponto medido no popup enviado pelo usuario.
-            x, y = norm_point_in_window_to_abs(
-                self.remote_title,
-                (0.417, 0.548),
-                content_only=False,
-            )
-            pyautogui.click(x, y)
+        left, top, width, height = grid_region_abs
+        # Evita a borda/scrollbar, mas cobre praticamente a URL inteira.
+        x1 = left + max(10, int(width * 0.015))
+        x2 = left + width - max(25, int(width * 0.025))
+        y = int(y_abs)
 
+        # Ctrl+Y e o atalho classico do SAP GUI para selecionar texto em bloco.
+        pyautogui.hotkey("ctrl", "y")
+        time.sleep(0.20)
+        pyautogui.moveTo(x1, y, duration=0.15)
+        pyautogui.dragTo(x2, y, duration=0.70, button="left")
+        time.sleep(0.15)
+        pyautogui.hotkey("ctrl", "c")
+
+        deadline = time.time() + 2.5
+        copied = ""
+        while time.time() < deadline:
+            copied = _read_windows_clipboard_text().strip()
+            if copied:
+                break
+            time.sleep(0.10)
+
+        # Sai de eventual modo de selecao sem ativar o hyperlink.
+        pyautogui.press("esc")
+        time.sleep(0.10)
+
+        return _extract_jpg_url(copied)
+
+    def _collect_target_urls_from_remote(self, obra: str) -> dict[str, str]:
+        """Le todas as linhas visiveis da grade e recolhe somente os 3 JPGs."""
+        self._activate_remote()
         time.sleep(0.35)
 
-    def _popup_contains_target(self, aliases) -> tuple[bool, str]:
-        """Le o URL do popup, onde o nome do JPG aparece em fonte maior."""
-        found, _, _ = locate_text_on_screen(
-            aliases,
-            [0.18, 0.30, 0.62, 0.36],
-            lang=self.lang,
-            threshold=32,
-            psm=6,
+        row_centers, debug_img, region_abs = detect_link_row_centers(
             window_title=self.remote_title,
+            # Area real da tabela Links nas telas 1920x1080 enviadas.
+            region_norm=(0.012, 0.285, 0.615, 0.245),
         )
-        if found:
-            return True, found.text
-        return False, ""
+        self._save_ocr_debug(obra, "LINKS", debug_img, "linhas_detectadas")
 
-    def _browser_contains_target(self, aliases) -> tuple[bool, str]:
-        """Fallback quando o SAP ja memorizou Permitir e abre a foto direto."""
-        found, _, _ = locate_text_on_screen(
-            aliases,
-            [0.00, 0.00, 1.00, 0.18],
-            lang=self.lang,
-            threshold=32,
-            psm=6,
-            window_title=self.remote_title,
-        )
-        if found:
-            return True, found.text
-        return False, ""
+        # Se a deteccao visual falhar, usa a geometria regular da grade SAP.
+        if len(row_centers) < 3:
+            left, top, width, height = region_abs
+            first_y = top + int(height * 0.10)
+            spacing = max(19, int(height * 0.087))
+            row_centers = [first_y + i * spacing for i in range(12)]
+            self.emit(
+                f"Obra {obra}: deteccao automatica das linhas foi insuficiente; "
+                "usando varredura geometrica da grade.",
+                level="warning",
+            )
 
-    def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
-        """Localiza e abre o link exato da foto na grade Links.
+        target_by_alias: list[tuple[str, str]] = []
+        for target in FIXED_TARGETS:
+            key = target["key"]
+            for alias in target.get("aliases", []):
+                clean = str(alias).upper().replace(".JPG", "").replace(" ", "")
+                target_by_alias.append((key, clean))
 
-        O RDP já está em tela cheia. Por isso esta versão faz OCR diretamente
-        sobre uma captura da tela local completa e usa a região fixa da grade
-        Links observada nos prints 1920x1080. Não depende mais da geometria da
-        janela RDP nem de offsets da barra de título.
-        """
-        aliases = target.get("aliases", [target.get("key", "")])
-        key = target.get("key", "FOTO")
+        found: dict[str, str] = {}
+        seen_urls: set[str] = set()
 
-        self._activate_remote()
-        time.sleep(0.30)
+        for index, y in enumerate(sorted(row_centers), start=1):
+            if len(found) == len(FIXED_TARGETS):
+                break
 
-        found, debug_img, region_abs = locate_link_row_fullscreen(
-            aliases,
-            lang=self.lang,
-            threshold=56,
-        )
+            url = self._copy_url_from_link_row(y, region_abs)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
 
-        self._save_ocr_debug(
-            obra,
-            key,
-            debug_img,
-            "busca_link_tela_cheia",
-        )
+            normalized = url.upper().replace("%20", " ").replace(" ", "")
+            matched_key = None
+            for key, alias in target_by_alias:
+                if alias and alias in normalized:
+                    matched_key = key
+                    break
+
+            if matched_key and matched_key not in found:
+                found[matched_key] = url
+                self.emit(
+                    f"Obra {obra}: link {matched_key} copiado da Area Remota "
+                    f"(linha {index}).",
+                    level="success",
+                )
 
         if not found:
-            self.emit(
-                f"Obra {obra}: {key} nao foi reconhecido na grade Links.",
-                level="warning",
-            )
-            return False, ""
-
-        # O OCR retorna a caixa da linha inteira. O centro dessa caixa fica
-        # necessariamente sobre a URL/hyperlink, portanto é mais seguro do
-        # que usar um X fixo.
-        click_x, click_y = found.center
-
-        # Mantém o clique dentro da grade, longe das barras/menu do SAP.
-        min_x = region_abs[0] + 40
-        max_x = region_abs[0] + region_abs[2] - 40
-        min_y = region_abs[1] + 15
-        max_y = region_abs[1] + region_abs[3] - 15
-        click_x = max(min_x, min(click_x, max_x))
-        click_y = max(min_y, min(click_y, max_y))
-
-        self.emit(
-            (
-                f"Obra {obra}: {key} reconhecido na grade "
-                f"(score {found.score:.0f}) em X={click_x}, Y={click_y}. "
-                f"Clicando no hyperlink..."
-            ),
-            level="success",
-        )
-
-        self._activate_remote()
-        pyautogui.moveTo(click_x, click_y, duration=0.20)
-        pyautogui.click()
-
-        popup = wait_for_text(
-            ["Seguranca SAPGUI", "Segurança SAPGUI", "Permitir", "Rejeitar"],
-            [0.15, 0.25, 0.70, 0.45],
-            lang=self.lang,
-            threshold=34,
-            timeout=3.2,
-            poll_interval=0.25,
-            window_title=self.remote_title,
-        )
-
-        if not popup:
-            # Alguns links exigem um segundo clique para ativação. Repetimos
-            # SOMENTE no mesmo ponto já validado pelo OCR.
-            self.emit(
-                f"Obra {obra}: primeiro clique nao abriu o popup; repetindo no mesmo hyperlink...",
-                level="warning",
-            )
-            pyautogui.moveTo(click_x, click_y, duration=0.12)
-            pyautogui.click()
-            popup = wait_for_text(
-                ["Seguranca SAPGUI", "Segurança SAPGUI", "Permitir", "Rejeitar"],
-                [0.15, 0.25, 0.70, 0.45],
-                lang=self.lang,
-                threshold=34,
-                timeout=3.2,
-                poll_interval=0.25,
-                window_title=self.remote_title,
+            raise RuntimeError(
+                "Nenhum link JPG conseguiu ser copiado da grade. Verifique se o "
+                "redirecionamento da Area de Transferencia/Clipboard esta habilitado "
+                "na conexao RDP. O robo usa Ctrl+Y + Ctrl+C no SAP e precisa que o "
+                "texto copiado chegue ao PC local."
             )
 
-        if not popup:
-            # Pode haver política que abre o navegador diretamente sem popup.
-            browser_ok, browser_text = self._browser_contains_target(aliases)
-            if browser_ok:
-                return True, browser_text or found.text
+        return found
 
-            self.emit(
-                f"Obra {obra}: {key} foi reconhecido, mas o clique nao abriu o popup/foto.",
-                level="warning",
+    def _download_photo_local(
+        self,
+        obra: str,
+        target: Dict,
+        url: str,
+        obra_dir: Path,
+    ) -> dict:
+        """Abre o link no navegador LOCAL, baixa a imagem e executa OCR local."""
+        key = str(target.get("key", "FOTO"))
+        suffix = str(target.get("output_suffix") or key)
+
+        # URLs exibidas no SAP podem conter espacos literais.
+        local_url = urlparse.quote(url, safe=":/?&=%#@+;,[]")
+
+        self.emit(f"Obra {obra}: abrindo {key} no navegador local...")
+        try:
+            webbrowser.open(local_url, new=2, autoraise=True)
+        except Exception:
+            # Abrir visualmente e util, mas nao deve impedir o download automatico.
+            pass
+
+        req = urlrequest.Request(
+            local_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                )
+            },
+        )
+
+        raw = None
+        download_error = None
+        try:
+            with urlrequest.urlopen(req, timeout=30) as response:
+                raw = response.read()
+        except Exception as exc:
+            download_error = exc
+
+        photo: Optional[Image.Image] = None
+        if raw:
+            try:
+                photo = Image.open(BytesIO(raw))
+                photo.load()
+                photo = photo.convert("RGB")
+            except Exception as exc:
+                download_error = exc
+                photo = None
+
+        # Fallback: se o browser local conseguiu abrir, mas o HTTP do Python nao
+        # (por exemplo, autenticacao/certificado corporativo), tenta capturar a
+        # foto diretamente da janela local atualmente ativa.
+        if photo is None:
+            time.sleep(2.5)
+            active = active_window_title().lower()
+            if self.remote_title.lower() not in active:
+                local_screen = pyautogui.screenshot()
+                candidate, _, cropped = extract_largest_photo_from_screen(
+                    local_screen,
+                    [0.00, 0.05, 1.00, 0.90],
+                    min_area_ratio=0.015,
+                )
+                if cropped and candidate.width >= 180 and candidate.height >= 180:
+                    photo = candidate.convert("RGB")
+
+        if photo is None:
+            raise RuntimeError(
+                f"O link {key} foi copiado corretamente, mas o PC local nao "
+                f"conseguiu carregar a imagem. URL: {url}. Erro: {download_error}. "
+                "Abra esse endereco manualmente no navegador local. Se ele nao abrir, "
+                "o dominio .corp provavelmente so e acessivel dentro do ambiente remoto "
+                "ou exige autenticacao/VPN local."
             )
-            return False, found.text
 
-        return True, found.text
-
-    def _permit_if_needed(self):
-        """Clica Permitir apenas quando o popup Segurança SAPGUI estiver presente.
-
-        Se a decisao ja estiver memorizada e a imagem abriu diretamente, nao clica
-        em coordenada fixa sobre a foto/navegador.
-        """
-        time.sleep(max(0.8, float(self.cfg.get("timing", {}).get("after_link_click", 1.0))))
-
-        popup = wait_for_text(
-            ["Seguranca SAPGUI", "Segurança SAPGUI"],
-            [0.18, 0.28, 0.62, 0.38],
-            lang=self.lang,
-            threshold=42,
-            timeout=2.0,
-            poll_interval=0.25,
-            window_title=self.remote_title,
-        )
-
-        if not popup:
-            # Ja abriu direto; nao ha nada para permitir.
-            return False
-
-        clicked, _ = click_text(
-            ["Permitir"],
-            [0.18, 0.28, 0.62, 0.38],
-            lang=self.lang,
-            threshold=45,
-            window_title=self.remote_title,
-        )
-
-        if not clicked:
-            x, y = norm_point_in_window_to_abs(
-                self.remote_title,
-                (0.357, 0.548),
-                content_only=False,
-            )
-            pyautogui.click(x, y)
-
-        time.sleep(max(2.0, float(self.cfg.get("timing", {}).get("after_permit", 2.0))))
-        return True
-
-    def _maximize_photo(self):
-        if not self.cfg.get("automation", {}).get("maximize_photo_window", True):
-            return
-        # O navegador da foto está dentro da sessão RDP. O último clique foi no SAP,
-        # portanto o atalho é encaminhado à aplicação remota ativa.
-        pyautogui.hotkey("alt", "space")
-        time.sleep(0.25)
-        pyautogui.press("x")
-        time.sleep(float(self.cfg["timing"]["after_maximize"]))
-
-    def _capture_photo_and_coordinates(self, obra: str, target: Dict, obra_dir: Path) -> dict:
-        """Tira o print da foto, salva o JPG e extrai latitude/longitude."""
-        # Aguarda a imagem terminar de carregar no navegador remoto.
-        time.sleep(1.5)
-
-        remote_screen, remote_abs_region = screenshot_window_contains(
-            self.remote_title,
-            content_only=False,
-        )
-
-        # Regiao ampla do navegador. Funciona tanto com navegador maximizado
-        # quanto com a janela aberta sobre o SAP.
-        photo, bbox_local, cropped = extract_largest_photo_from_screen(
-            remote_screen,
-            [0.00, 0.04, 1.00, 0.92],
-            min_area_ratio=0.01,
-        )
-
-        bbox_abs = (
-            remote_abs_region[0] + bbox_local[0],
-            remote_abs_region[1] + bbox_local[1],
-            bbox_local[2],
-            bbox_local[3],
-        )
+        out_file = obra_dir / f"{obra}_{suffix}.jpg"
+        photo.save(out_file, quality=95)
+        if "FACHADA" in key.upper():
+            photo.save(obra_dir / f"{obra}.jpg", quality=95)
 
         result = extract_coordinates_from_photo(
             photo,
@@ -542,74 +566,41 @@ class SAPPhotoBot:
             ),
         )
 
-        # Fallback de coordenada: se o recorte principal nao trouxe o carimbo,
-        # tenta uma area grande da metade esquerda do navegador, onde a foto abre.
-        if result.get("latitude") is None or result.get("longitude") is None:
-            rw, rh = remote_screen.size
-            fallback_photo = remote_screen.crop(
-                (0, int(rh * 0.04), int(rw * 0.65), int(rh * 0.96))
-            )
-            fallback_result = extract_coordinates_from_photo(
-                fallback_photo,
-                lang=self.lang,
-                prefer_negative_lat=bool(
-                    self.cfg.get("ocr", {}).get("prefer_negative_latitude", True)
-                ),
-            )
-            if (
-                fallback_result.get("latitude") is not None
-                and fallback_result.get("longitude") is not None
-            ):
-                result = fallback_result
-
-        suffix = str(target.get("output_suffix") or target.get("key") or "FOTO")
-        out_file = obra_dir / f"{obra}_{suffix}.jpg"
-
-        # Este e o print da FOTO solicitado pelo usuario.
-        photo_rgb = photo.convert("RGB")
-        photo_rgb.save(out_file, quality=95)
-
-        # A fachada tambem fica com o nome simples NUMERO_DA_OBRA.jpg.
-        if "FACHADA" in str(target.get("key", "")).upper():
-            photo_rgb.save(obra_dir / f"{obra}.jpg", quality=95)
-
         if self.cfg.get("ocr", {}).get("save_debug_images", True):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            remote_screen.convert("RGB").save(
-                self.debug_root / f"{obra}_{suffix}_tela_completa_{stamp}.jpg",
-                quality=85,
-            )
-            photo_rgb.save(
-                self.debug_root / f"{obra}_{suffix}_foto_detectada_{stamp}.jpg",
+            photo.save(
+                self.debug_root / f"{obra}_{suffix}_local_{stamp}.jpg",
                 quality=90,
             )
             meta = {
-                "remote_window": self.remote_title,
-                "remote_region_abs": remote_abs_region,
-                "bbox_local_rdp": bbox_local,
-                "bbox_abs_monitor": bbox_abs,
-                "cropped": cropped,
+                "url_copiada": url,
+                "url_local": local_url,
                 "latitude": result.get("latitude"),
                 "longitude": result.get("longitude"),
                 "variant": result.get("variant"),
                 "ocr_text": result.get("ocr_text", ""),
             }
-            (self.debug_root / f"{obra}_{suffix}_ocr_{stamp}.json").write_text(
+            (self.debug_root / f"{obra}_{suffix}_local_{stamp}.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
+        # Fecha a aba local somente quando ela esta efetivamente em primeiro plano.
+        try:
+            active = active_window_title().lower()
+            if active and self.remote_title.lower() not in active:
+                pyautogui.hotkey("ctrl", "w")
+                time.sleep(0.35)
+        except Exception:
+            pass
+
+        self._activate_remote()
+
         return {
             "path": out_file,
-            "cropped": cropped,
-            "bbox": bbox_abs,
+            "url": url,
             **result,
         }
-
-    def _close_photo(self):
-        if self.cfg.get("automation", {}).get("close_photo_with_alt_f4", True):
-            pyautogui.hotkey("alt", "f4")
-            time.sleep(float(self.cfg["timing"]["after_close_photo"]))
 
     def _error_screenshot(self, obra: str, stage: str):
         try:
@@ -640,19 +631,16 @@ class SAPPhotoBot:
             self._open_images_tab()
             self.emit(f"Obra {obra}: Imagens de Campo aberta.", progress=(base_step + 2) / total_steps)
 
+            # Primeiro copia os links da Area Remota para o clipboard local.
+            # A partir daqui as fotos sao abertas/processadas no proprio PC.
+            copied_urls = self._collect_target_urls_from_remote(obra)
+
             for ti, target in enumerate(targets):
                 tkey = target.get("key", f"FOTO_{ti + 1}")
                 step0 = base_step + 3 + ti * 4
+                url = copied_urls.get(tkey, "")
 
-                # Mensagem genérica para evitar que o próprio nome do arquivo apareça
-                # no painel local durante a etapa de OCR.
-                self.emit(
-                    f"Obra {obra}: analisando links da imagem {ti + 1}/{len(targets)}...",
-                    progress=step0 / total_steps,
-                )
-
-                found, link_text = self._locate_and_click_link(obra, target)
-                if not found:
+                if not url:
                     records.append({
                         "OBRA": obra,
                         "TIPO_FOTO": tkey,
@@ -660,68 +648,78 @@ class SAPPhotoBot:
                         "LATITUDE": "",
                         "LONGITUDE": "",
                         "ARQUIVO_FOTO": "",
-                        "STATUS_LINK": "NÃO ENCONTRADO",
-                        "STATUS_COORDENADA": "NÃO PROCESSADA",
+                        "STATUS_LINK": "NAO COPIADO",
+                        "STATUS_COORDENADA": "NAO PROCESSADA",
                         "OCR_RODAPE": "",
                         "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                     })
                     self.emit(
-                        f"Obra {obra}: imagem {ti + 1} não localizada no SAP.",
+                        f"Obra {obra}: link {tkey} nao foi encontrado entre as URLs copiadas.",
                         level="warning",
                         progress=(step0 + 1) / total_steps,
                     )
-                    if not self.cfg.get("automation", {}).get("continue_when_photo_missing", True):
-                        raise RuntimeError(f"Link {tkey} não encontrado.")
                     continue
 
                 self.emit(
-                    f"Obra {obra}: link da imagem {ti + 1} localizado; liberando abertura...",
-                    progress=(step0 + 1) / total_steps,
+                    f"Obra {obra}: processando imagem {ti + 1}/{len(targets)} no PC local...",
+                    progress=step0 / total_steps,
                 )
-                self._permit_if_needed()
-                self._maximize_photo()
-                self.emit(
-                    f"Obra {obra}: capturando imagem {ti + 1} e lendo coordenada...",
-                    progress=(step0 + 2) / total_steps,
-                )
-                photo_result = self._capture_photo_and_coordinates(obra, target, obra_dir)
 
-                lat = photo_result.get("latitude")
-                lon = photo_result.get("longitude")
-                coord_status = "OK" if lat is not None and lon is not None else "COORDENADA NÃO RECONHECIDA"
-
-                records.append({
-                    "OBRA": obra,
-                    "TIPO_FOTO": tkey,
-                    "LINK_IDENTIFICADO_OCR": link_text,
-                    "LATITUDE": lat if lat is not None else "",
-                    "LONGITUDE": lon if lon is not None else "",
-                    "ARQUIVO_FOTO": str(photo_result["path"]),
-                    "STATUS_LINK": "OK",
-                    "STATUS_COORDENADA": coord_status,
-                    "OCR_RODAPE": photo_result.get("ocr_text", ""),
-                    "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                })
-
-                if coord_status == "OK":
-                    self.emit(
-                        f"Obra {obra}: coordenada da imagem {ti + 1} → {lat:.6f}, {lon:.6f}",
-                        level="success",
+                try:
+                    photo_result = self._download_photo_local(
+                        obra,
+                        target,
+                        url,
+                        obra_dir,
                     )
-                else:
-                    self.emit(
-                        f"Obra {obra}: imagem {ti + 1} salva, mas a coordenada não foi reconhecida.",
-                        level="warning",
+                    lat = photo_result.get("latitude")
+                    lon = photo_result.get("longitude")
+                    coord_status = (
+                        "OK"
+                        if lat is not None and lon is not None
+                        else "COORDENADA NAO RECONHECIDA"
                     )
-                    if not self.cfg.get("automation", {}).get("continue_when_coordinate_missing", True):
-                        raise RuntimeError(f"Coordenada de {tkey} não reconhecida.")
-
-                self._close_photo()
-                self._activate_remote()
-                self.emit(
-                    f"Obra {obra}: imagem {ti + 1} concluída.",
-                    progress=(step0 + 4) / total_steps,
-                )
+                    records.append({
+                        "OBRA": obra,
+                        "TIPO_FOTO": tkey,
+                        "LINK_IDENTIFICADO_OCR": url,
+                        "LATITUDE": lat if lat is not None else "",
+                        "LONGITUDE": lon if lon is not None else "",
+                        "ARQUIVO_FOTO": str(photo_result["path"]),
+                        "STATUS_LINK": "COPIADO/LOCAL",
+                        "STATUS_COORDENADA": coord_status,
+                        "OCR_RODAPE": photo_result.get("ocr_text", ""),
+                        "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    })
+                    if coord_status == "OK":
+                        self.emit(
+                            f"Obra {obra}: {tkey} salvo; coordenada {lat:.6f}, {lon:.6f}.",
+                            level="success",
+                        )
+                    else:
+                        self.emit(
+                            f"Obra {obra}: {tkey} salvo, mas a coordenada nao foi reconhecida.",
+                            level="warning",
+                        )
+                except Exception as exc:
+                    records.append({
+                        "OBRA": obra,
+                        "TIPO_FOTO": tkey,
+                        "LINK_IDENTIFICADO_OCR": url,
+                        "LATITUDE": "",
+                        "LONGITUDE": "",
+                        "ARQUIVO_FOTO": "",
+                        "STATUS_LINK": "ERRO LOCAL",
+                        "STATUS_COORDENADA": "NAO PROCESSADA",
+                        "OCR_RODAPE": "",
+                        "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    })
+                    self.emit(
+                        f"Obra {obra}: falha ao processar {tkey} no PC local: {exc}",
+                        level="error",
+                    )
+                    if not self.cfg.get("automation", {}).get("continue_when_photo_missing", True):
+                        raise
 
             excel_path = save_work_excel(records, obra_dir / f"{obra}_coordenadas.xlsx")
             if self.cfg.get("output", {}).get("create_consolidated_excel", True):
