@@ -18,6 +18,7 @@ from .vision import (
     extract_largest_photo_from_screen,
     locate_text_on_screen,
     locate_link_filename_on_screen,
+    locate_link_row_robust,
     save_debug_image,
     wait_for_text,
 )
@@ -104,15 +105,15 @@ class SAPPhotoBot:
         return activate_window_contains(self.remote_title, wait=0.35)
 
     def _prepare_remote_for_automation(self):
-        """Coloca o RDP em tela maximizada antes de qualquer clique no SAP.
+        """Ativa a Area Remota sem alterar o tamanho da janela.
 
-        O SAP reorganiza e redimensiona os controles quando a janela RDP fica em
-        meia tela. Por isso o robo maximiza a janela local do RDP e so entao usa
-        os pontos normalizados calibrados para a tela cheia.
+        O usuario ja utiliza o RDP em tela cheia. Forcar maximizacao aqui pode
+        alterar foco/escala desnecessariamente, portanto esta versao apenas
+        garante que a sessao esteja ativa.
         """
-        self.emit("Preparando Área Remota em tela maximizada...")
-        maximize_window_contains(self.remote_title, wait=1.2, timeout=6.0)
+        self.emit("Preparando Área Remota...")
         self._activate_remote()
+        time.sleep(0.5)
 
     def _click_point(self, key: str):
         """Clica em um ponto normalizado RELATIVO À JANELA RDP."""
@@ -301,52 +302,46 @@ class SAPPhotoBot:
         save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
 
     def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
-        """Localiza o nome do JPG e clica na mesma linha do hyperlink.
+        """Localiza o nome do JPG na grade Links e clica na mesma linha.
 
-        O OCR e feito SOMENTE na parte direita da grade, onde aparecem os nomes
-        FACHADADOIMOVEL / ADESIVOLIGACAONOVA / FOTOPANORAMICA. Depois de achar
-        a linha, o clique e feito na parte esquerda da MESMA linha, sobre a URL.
+        A busca e feita somente na parte da grade em que aparece o nome do
+        arquivo, nunca na tela do Streamlit e nunca na URL inteira.
         """
         aliases = target.get("aliases", [target.get("key", "")])
         pages = max(1, int(self.cfg.get("automation", {}).get("scroll_pages_links", 4)))
 
         self._activate_remote()
 
-        # Faixa onde os nomes dos arquivos aparecem na grade em RDP maximizado.
-        # Evita OCR no prefixo enorme da URL e melhora muito a leitura.
-        filename_region = [0.20, 0.25, 0.43, 0.36]
-
-        # Garante que a grade esteja no topo antes de procurar cada foto.
         win_left, win_top, win_w, win_h = get_window_region_contains(
             self.remote_title,
             content_only=False,
         )
+
+        # Centro da grade de Links. Usado somente para rolagem.
         grid_x = win_left + int(win_w * 0.30)
         grid_y = win_top + int(win_h * 0.42)
-        pyautogui.moveTo(grid_x, grid_y)
-        pyautogui.scroll(20)
-        time.sleep(0.5)
+
+        # Sempre volta ao topo antes de procurar uma das tres fotos.
+        pyautogui.moveTo(grid_x, grid_y, duration=0.15)
+        pyautogui.scroll(35)
+        time.sleep(0.65)
 
         last_img = None
 
         for page in range(pages):
-            found, img, region_abs = locate_link_filename_on_screen(
+            found, img, region_abs = locate_link_row_robust(
                 aliases,
-                filename_region,
-                lang=self.lang,
-                threshold=58,
                 window_title=self.remote_title,
+                lang=self.lang,
+                threshold=44,
             )
             last_img = img
 
             if found:
-                # O hyperlink ocupa a linha inteira. Clica mais a esquerda, onde a
-                # URL e certamente clicavel, mantendo exatamente o Y reconhecido.
+                # Toda a URL e hyperlink. Para evitar errar no sufixo, usamos
+                # apenas o Y identificado pelo OCR e um X fixo no inicio da URL.
                 click_x = win_left + int(win_w * 0.10)
                 click_y = found.center[1]
-
-                pyautogui.moveTo(click_x, click_y, duration=0.20)
-                pyautogui.click()
 
                 self._save_ocr_debug(
                     obra,
@@ -356,9 +351,14 @@ class SAPPhotoBot:
                 )
 
                 self.emit(
-                    f"Obra {obra}: {target.get('key', 'FOTO')} localizado na grade.",
+                    f"Obra {obra}: {target.get('key', 'FOTO')} localizado: {found.text}",
                     level="success",
                 )
+
+                self._activate_remote()
+                pyautogui.moveTo(click_x, click_y, duration=0.20)
+                pyautogui.click()
+                time.sleep(0.8)
                 return True, found.text
 
             if page == 0 and last_img is not None:
@@ -369,11 +369,15 @@ class SAPPhotoBot:
                     "link_nao_encontrado",
                 )
 
-            # Rola somente dentro da grade para procurar linhas abaixo.
-            pyautogui.moveTo(grid_x, grid_y)
-            pyautogui.scroll(-6)
-            time.sleep(0.65)
+            # Se existirem mais links abaixo, procura a proxima parte da grade.
+            pyautogui.moveTo(grid_x, grid_y, duration=0.10)
+            pyautogui.scroll(-7)
+            time.sleep(0.70)
 
+        self.emit(
+            f"Obra {obra}: não foi possível localizar {target.get('key', 'FOTO')} na grade Links.",
+            level="warning",
+        )
         return False, ""
 
     def _permit_if_needed(self):
