@@ -19,6 +19,7 @@ from .vision import (
     locate_text_on_screen,
     locate_link_filename_on_screen,
     locate_link_row_robust,
+    detect_link_row_centers,
     save_debug_image,
     wait_for_text,
 )
@@ -301,105 +302,217 @@ class SAPPhotoBot:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
 
-    def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
-        """Localiza o nome do JPG na grade Links e clica na mesma linha.
+    def _dismiss_security_popup(self) -> None:
+        """Fecha o popup Segurança SAPGUI quando o link nao e o desejado."""
+        popup_region = [0.18, 0.30, 0.62, 0.36]
 
-        A busca e feita somente na parte da grade em que aparece o nome do
-        arquivo, nunca na tela do Streamlit e nunca na URL inteira.
+        clicked, _ = click_text(
+            ["Rejeitar"],
+            popup_region,
+            lang=self.lang,
+            threshold=40,
+            window_title=self.remote_title,
+        )
+
+        if not clicked:
+            # Ponto medido no popup enviado pelo usuario.
+            x, y = norm_point_in_window_to_abs(
+                self.remote_title,
+                (0.417, 0.548),
+                content_only=False,
+            )
+            pyautogui.click(x, y)
+
+        time.sleep(0.35)
+
+    def _popup_contains_target(self, aliases) -> tuple[bool, str]:
+        """Le o URL do popup, onde o nome do JPG aparece em fonte maior."""
+        found, _, _ = locate_text_on_screen(
+            aliases,
+            [0.18, 0.30, 0.62, 0.36],
+            lang=self.lang,
+            threshold=32,
+            psm=6,
+            window_title=self.remote_title,
+        )
+        if found:
+            return True, found.text
+        return False, ""
+
+    def _browser_contains_target(self, aliases) -> tuple[bool, str]:
+        """Fallback quando o SAP ja memorizou Permitir e abre a foto direto."""
+        found, _, _ = locate_text_on_screen(
+            aliases,
+            [0.00, 0.00, 1.00, 0.18],
+            lang=self.lang,
+            threshold=32,
+            psm=6,
+            window_title=self.remote_title,
+        )
+        if found:
+            return True, found.text
+        return False, ""
+
+    def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
+        """Abre o link correto SEM depender do OCR do texto pequeno da grade.
+
+        Estrategia:
+          1. detecta visualmente os centros Y de cada linha da grade Links;
+          2. clica cada hyperlink visivel, um por vez;
+          3. no popup Segurança SAPGUI, le o URL em fonte maior;
+          4. se o popup contem o nome desejado, deixa o popup aberto e retorna;
+          5. se nao contem, clica Rejeitar e testa a proxima linha.
+
+        Assim FACHADADOIMOVEL / ADESIVOLIGACAONOVA / FOTOPANORAMICA
+        nao precisam ser reconhecidos na fonte minuscula da grade.
         """
         aliases = target.get("aliases", [target.get("key", "")])
-        pages = max(1, int(self.cfg.get("automation", {}).get("scroll_pages_links", 4)))
+        key = target.get("key", "FOTO")
+        pages = max(1, int(self.cfg.get("automation", {}).get("scroll_pages_links", 3)))
 
         self._activate_remote()
-
         win_left, win_top, win_w, win_h = get_window_region_contains(
             self.remote_title,
             content_only=False,
         )
 
-        # Centro da grade de Links. Usado somente para rolagem.
+        # X dentro do texto do hyperlink, perto do inicio da URL.
+        click_x = win_left + int(win_w * 0.060)
         grid_x = win_left + int(win_w * 0.30)
-        grid_y = win_top + int(win_h * 0.42)
+        grid_y = win_top + int(win_h * 0.43)
 
-        # Sempre volta ao topo antes de procurar uma das tres fotos.
+        # Sempre volta ao topo da lista antes de procurar um alvo.
         pyautogui.moveTo(grid_x, grid_y, duration=0.15)
-        pyautogui.scroll(35)
-        time.sleep(0.65)
+        pyautogui.scroll(40)
+        time.sleep(0.60)
 
-        last_img = None
+        scanned = 0
 
         for page in range(pages):
-            found, img, region_abs = locate_link_row_robust(
-                aliases,
+            row_ys, debug_img, region_abs = detect_link_row_centers(
                 window_title=self.remote_title,
-                lang=self.lang,
-                threshold=44,
             )
-            last_img = img
 
-            if found:
-                # Toda a URL e hyperlink. Para evitar errar no sufixo, usamos
-                # apenas o Y identificado pelo OCR e um X fixo no inicio da URL.
-                click_x = win_left + int(win_w * 0.10)
-                click_y = found.center[1]
-
+            if page == 0:
                 self._save_ocr_debug(
                     obra,
-                    target.get("key", "FOTO"),
-                    img,
-                    "link_encontrado",
+                    key,
+                    debug_img,
+                    "linhas_detectadas",
                 )
 
+            # Fallback geometrico caso a deteccao visual nao ache linhas.
+            if len(row_ys) < 2:
+                first_y = win_top + int(win_h * 0.350)
+                step_y = max(16, int(win_h * 0.029))
+                row_ys = [first_y + i * step_y for i in range(12)]
                 self.emit(
-                    f"Obra {obra}: {target.get('key', 'FOTO')} localizado: {found.text}",
-                    level="success",
+                    f"Obra {obra}: deteccao visual das linhas fraca; usando varredura geometrica.",
+                    level="warning",
                 )
 
+            for row_index, click_y in enumerate(row_ys, start=1):
+                scanned += 1
                 self._activate_remote()
-                pyautogui.moveTo(click_x, click_y, duration=0.20)
+                pyautogui.moveTo(click_x, click_y, duration=0.12)
                 pyautogui.click()
-                time.sleep(0.8)
-                return True, found.text
+                time.sleep(0.45)
 
-            if page == 0 and last_img is not None:
-                self._save_ocr_debug(
-                    obra,
-                    target.get("key", "FOTO"),
-                    last_img,
-                    "link_nao_encontrado",
+                # Caso normal: popup Segurança SAPGUI abriu.
+                popup = wait_for_text(
+                    ["Seguranca SAPGUI", "Segurança SAPGUI"],
+                    [0.18, 0.28, 0.62, 0.38],
+                    lang=self.lang,
+                    threshold=42,
+                    timeout=1.8,
+                    poll_interval=0.25,
+                    window_title=self.remote_title,
                 )
 
-            # Se existirem mais links abaixo, procura a proxima parte da grade.
+                if popup:
+                    matched, popup_text = self._popup_contains_target(aliases)
+
+                    if matched:
+                        self.emit(
+                            f"Obra {obra}: {key} confirmado no popup da linha {row_index}.",
+                            level="success",
+                        )
+                        # Deixa o popup aberto. _permit_if_needed() clicara Permitir.
+                        return True, popup_text or key
+
+                    # Link de outra foto: rejeita e continua.
+                    self._dismiss_security_popup()
+                    continue
+
+                # Se a decisao foi memorizada, a foto pode abrir direto.
+                matched, browser_text = self._browser_contains_target(aliases)
+                if matched:
+                    self.emit(
+                        f"Obra {obra}: {key} abriu diretamente na linha {row_index}.",
+                        level="success",
+                    )
+                    return True, browser_text or key
+
+                # Se abriu outra imagem direto, fecha e volta para a grade.
+                # Um pequeno teste visual: se a tela nao parece mais ter a grade Links,
+                # Alt+F4 volta ao SAP. Se o clique simplesmente nao abriu nada, o Alt+F4
+                # nao deve ser disparado.
+                still_links = wait_for_text(
+                    ["Links"],
+                    [0.00, 0.20, 0.72, 0.55],
+                    lang=self.lang,
+                    threshold=35,
+                    timeout=0.45,
+                    poll_interval=0.20,
+                    window_title=self.remote_title,
+                )
+                if not still_links:
+                    pyautogui.hotkey("alt", "f4")
+                    time.sleep(0.55)
+                    self._activate_remote()
+
+            # Proxima pagina da grade.
             pyautogui.moveTo(grid_x, grid_y, duration=0.10)
-            pyautogui.scroll(-7)
+            pyautogui.scroll(-8)
             time.sleep(0.70)
 
         self.emit(
-            f"Obra {obra}: não foi possível localizar {target.get('key', 'FOTO')} na grade Links.",
+            f"Obra {obra}: {key} nao foi confirmado apos testar {scanned} linhas da grade Links.",
             level="warning",
         )
         return False, ""
 
     def _permit_if_needed(self):
-        """Libera o popup Segurança SAPGUI.
+        """Clica Permitir apenas quando o popup Segurança SAPGUI estiver presente.
 
-        Primeiro tenta OCR do botao Permitir. Se o OCR falhar, usa um ponto
-        normalizado conhecido do popup. Se a decisao ja estiver memorizada e o
-        navegador tiver aberto direto, o clique de fallback cai em uma area
-        inofensiva da pagina da foto.
+        Se a decisao ja estiver memorizada e a imagem abriu diretamente, nao clica
+        em coordenada fixa sobre a foto/navegador.
         """
-        time.sleep(max(1.0, float(self.cfg.get("timing", {}).get("after_link_click", 1.0))))
+        time.sleep(max(0.8, float(self.cfg.get("timing", {}).get("after_link_click", 1.0))))
+
+        popup = wait_for_text(
+            ["Seguranca SAPGUI", "Segurança SAPGUI"],
+            [0.18, 0.28, 0.62, 0.38],
+            lang=self.lang,
+            threshold=42,
+            timeout=2.0,
+            poll_interval=0.25,
+            window_title=self.remote_title,
+        )
+
+        if not popup:
+            # Ja abriu direto; nao ha nada para permitir.
+            return False
 
         clicked, _ = click_text(
             ["Permitir"],
-            [0.20, 0.28, 0.50, 0.36],
+            [0.18, 0.28, 0.62, 0.38],
             lang=self.lang,
             threshold=45,
             window_title=self.remote_title,
         )
 
         if not clicked:
-            # Ponto do botao Permitir medido nos prints fornecidos.
             x, y = norm_point_in_window_to_abs(
                 self.remote_title,
                 (0.357, 0.548),
@@ -407,7 +520,7 @@ class SAPPhotoBot:
             )
             pyautogui.click(x, y)
 
-        time.sleep(max(2.5, float(self.cfg.get("timing", {}).get("after_permit", 2.0))))
+        time.sleep(max(2.0, float(self.cfg.get("timing", {}).get("after_permit", 2.0))))
         return True
 
     def _maximize_photo(self):
