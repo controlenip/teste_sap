@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import re
 import shutil
+import subprocess
 import time
 import webbrowser
 from ctypes import wintypes
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
 
 import pyautogui
+import pyperclip
 from PIL import Image
 
 from .config import APP_DIR, resolve_output_root
@@ -90,47 +93,24 @@ def _read_windows_clipboard_text() -> str:
         user32.CloseClipboard()
 
 
-def _extract_jpg_url(text: str) -> str:
-    """Extrai um endereco HTTP/HTTPS terminado em .jpg do texto copiado."""
+def _extract_http_url(text: str) -> str:
+    """Extrai a primeira URL HTTP/HTTPS do texto copiado do SAP."""
     raw = str(text or "").replace("\r", " ").replace("\n", " ").strip()
     if not raw:
         return ""
-    match = re.search(r"https?://.*?\.jpg", raw, flags=re.IGNORECASE)
+    match = re.search(r"https?://[^\s\t]+", raw, flags=re.IGNORECASE)
     if not match:
         return ""
-    return match.group(0).strip().strip('"').strip("'")
+    url = match.group(0).strip().strip('"').strip("'")
+    return url.rstrip(";,)")
 
 
-# Fotos obrigatorias deste fluxo. Nao dependem mais do config.json.
-FIXED_TARGETS = [
-    {
-        "key": "FACHADADOIMOVEL",
-        "aliases": [
-            "FACHADADOIMOVEL",
-            "FACHADAIMOVEL",
-            "FACHADADOIMOVEL.JPG",
-            "FACHADAIMOVEL.JPG",
-        ],
-        "output_suffix": "FACHADADOIMOVEL",
-    },
-    {
-        "key": "ADESIVOLIGACAONOVA",
-        "aliases": [
-            "ADESIVOLIGACAONOVA",
-            "ADESIVOLIGACAONOVA.JPG",
-        ],
-        "output_suffix": "ADESIVOLIGACAONOVA",
-    },
-    {
-        "key": "FOTOPANORAMICA",
-        "aliases": [
-            "FOTOPANORAMICA",
-            "FOTOPANORAMICA.JPG",
-            "FOTO PANORAMICA",
-        ],
-        "output_suffix": "FOTOPANORAMICA",
-    },
-]
+# A coordenada deve ser extraida SOMENTE da foto de fachada.
+FACADE_ALIASES = (
+    "FACHADADOIMOVEL",
+    "FACHADAIMOVEL",
+    "FACHADA DO IMOVEL",
+)
 
 
 class SAPPhotoBot:
@@ -409,196 +389,289 @@ class SAPPhotoBot:
         pyautogui.press("esc")
         time.sleep(0.10)
 
-        return _extract_jpg_url(copied)
+        return _extract_http_url(copied)
 
-    def _collect_target_urls_from_remote(self, obra: str) -> dict[str, str]:
-        """Le todas as linhas visiveis da grade e recolhe somente os 3 JPGs."""
+    def _collect_all_urls_from_remote(self, obra: str) -> list[str]:
+        """Copia TODOS os links da grade Imagens de Campo.
+
+        O robo percorre a grade por paginas/rolagem, usa Ctrl+Y + Ctrl+C em
+        cada linha e acumula URLs unicas. A Area Remota e usada somente para
+        esta coleta. Depois disso o processamento ocorre no computador local.
+        """
         self._activate_remote()
-        time.sleep(0.35)
+        time.sleep(0.40)
+
+        region_norm = (0.012, 0.285, 0.615, 0.245)
+        urls: list[str] = []
+        seen: set[str] = set()
 
         row_centers, debug_img, region_abs = detect_link_row_centers(
             window_title=self.remote_title,
-            # Area real da tabela Links nas telas 1920x1080 enviadas.
-            region_norm=(0.012, 0.285, 0.615, 0.245),
+            region_norm=region_norm,
         )
-        self._save_ocr_debug(obra, "LINKS", debug_img, "linhas_detectadas")
+        self._save_ocr_debug(obra, "LINKS", debug_img, "inicio_coleta")
 
-        # Se a deteccao visual falhar, usa a geometria regular da grade SAP.
-        if len(row_centers) < 3:
-            left, top, width, height = region_abs
-            first_y = top + int(height * 0.10)
-            spacing = max(19, int(height * 0.087))
-            row_centers = [first_y + i * spacing for i in range(12)]
-            self.emit(
-                f"Obra {obra}: deteccao automatica das linhas foi insuficiente; "
-                "usando varredura geometrica da grade.",
-                level="warning",
+        left, top, width, height = region_abs
+        grid_x = left + max(40, width // 2)
+        grid_y = top + max(40, height // 2)
+
+        # Comeca no topo da lista.
+        pyautogui.moveTo(grid_x, grid_y, duration=0.15)
+        for _ in range(6):
+            pyautogui.scroll(10)
+            time.sleep(0.08)
+        time.sleep(0.50)
+
+        max_pages = int(self.cfg.get("automation", {}).get("max_link_pages", 15))
+        pages_without_new = 0
+
+        for page in range(max_pages):
+            row_centers, debug_img, region_abs = detect_link_row_centers(
+                window_title=self.remote_title,
+                region_norm=region_norm,
             )
 
-        target_by_alias: list[tuple[str, str]] = []
-        for target in FIXED_TARGETS:
-            key = target["key"]
-            for alias in target.get("aliases", []):
-                clean = str(alias).upper().replace(".JPG", "").replace(" ", "")
-                target_by_alias.append((key, clean))
+            if page == 0 or self.cfg.get("ocr", {}).get("save_debug_images", True):
+                self._save_ocr_debug(
+                    obra, "LINKS", debug_img, f"pagina_{page + 1}"
+                )
 
-        found: dict[str, str] = {}
-        seen_urls: set[str] = set()
+            left, top, width, height = region_abs
 
-        for index, y in enumerate(sorted(row_centers), start=1):
-            if len(found) == len(FIXED_TARGETS):
-                break
+            if len(row_centers) < 3:
+                first_y = top + int(height * 0.10)
+                spacing = max(19, int(height * 0.087))
+                row_centers = [first_y + i * spacing for i in range(12)]
 
-            url = self._copy_url_from_link_row(y, region_abs)
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
+            before = len(urls)
 
-            normalized = url.upper().replace("%20", " ").replace(" ", "")
-            matched_key = None
-            for key, alias in target_by_alias:
-                if alias and alias in normalized:
-                    matched_key = key
-                    break
-
-            if matched_key and matched_key not in found:
-                found[matched_key] = url
+            for y in sorted(row_centers):
+                url = self._copy_url_from_link_row(y, region_abs)
+                if not url:
+                    continue
+                url = url.strip()
+                if url in seen:
+                    continue
+                seen.add(url)
+                urls.append(url)
                 self.emit(
-                    f"Obra {obra}: link {matched_key} copiado da Area Remota "
-                    f"(linha {index}).",
+                    f"Obra {obra}: link {len(urls)} copiado da Area Remota.",
                     level="success",
                 )
 
-        if not found:
+            if len(urls) == before:
+                pages_without_new += 1
+            else:
+                pages_without_new = 0
+
+            if pages_without_new >= 2:
+                break
+
+            pyautogui.moveTo(left + width // 2, top + height // 2, duration=0.10)
+            pyautogui.scroll(-7)
+            time.sleep(0.65)
+
+        if not urls:
             raise RuntimeError(
-                "Nenhum link JPG conseguiu ser copiado da grade. Verifique se o "
-                "redirecionamento da Area de Transferencia/Clipboard esta habilitado "
-                "na conexao RDP. O robo usa Ctrl+Y + Ctrl+C no SAP e precisa que o "
-                "texto copiado chegue ao PC local."
+                "Nenhum link conseguiu ser copiado da grade. Verifique se o "
+                "redirecionamento da Area de Transferencia/Clipboard esta habilitado no RDP."
             )
 
-        return found
+        return urls
 
-    def _download_photo_local(
+    def _create_links_notepad(self, obra: str, obra_dir: Path, urls: list[str]) -> Path:
+        """Cria o bloco de notas da obra com um link por linha e o abre."""
+        txt_path = obra_dir / f"{obra}_links.txt"
+        txt_path.write_text("\n".join(urls) + "\n", encoding="utf-8")
+
+        try:
+            subprocess.Popen(["notepad.exe", str(txt_path)])
+            time.sleep(0.8)
+        except Exception as exc:
+            self.emit(
+                f"Obra {obra}: bloco de notas criado, mas nao abriu automaticamente: {exc}",
+                level="warning",
+            )
+
+        self.emit(
+            f"Obra {obra}: {len(urls)} link(s) gravado(s) em {txt_path.name}.",
+            level="success",
+        )
+        return txt_path
+
+    def _read_links_from_notepad_file(self, txt_path: Path) -> list[str]:
+        """Le os links do TXT; este arquivo vira a fonte local do processamento."""
+        lines = txt_path.read_text(encoding="utf-8").splitlines()
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in lines:
+            url = line.strip()
+            if not url or not url.lower().startswith(("http://", "https://")):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+        return out
+
+    def _safe_photo_filename(self, url: str, index: int) -> str:
+        parsed = urlparse.urlparse(url)
+        raw_name = urlparse.unquote(Path(parsed.path).name).strip()
+        if not raw_name:
+            raw_name = f"foto_{index:03d}.jpg"
+        raw_name = re.sub(r'[<>:"/\\|?*]+', "_", raw_name).strip(" .")
+        if not raw_name:
+            raw_name = f"foto_{index:03d}.jpg"
+        if "." not in raw_name:
+            raw_name += ".jpg"
+        return raw_name
+
+    def _unique_photo_path(self, obra_dir: Path, filename: str) -> Path:
+        path = obra_dir / filename
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix or ".jpg"
+        n = 2
+        while True:
+            candidate = obra_dir / f"{stem}_{n}{suffix}"
+            if not candidate.exists():
+                return candidate
+            n += 1
+
+    def _is_facade_url(self, url: str) -> bool:
+        normalized = urlparse.unquote(str(url)).upper()
+        compact = re.sub(r"[^A-Z0-9]", "", normalized)
+        return any(re.sub(r"[^A-Z0-9]", "", a) in compact for a in FACADE_ALIASES)
+
+    def _open_url_from_txt_in_default_browser(
+        self, obra: str, index: int, total: int, url: str
+    ):
+        self.emit(
+            f"Obra {obra}: abrindo link {index}/{total} do bloco de notas no navegador padrao..."
+        )
+        pyperclip.copy(url)
+        try:
+            webbrowser.open(url, new=2, autoraise=True)
+        except Exception:
+            try:
+                os.startfile(url)  # type: ignore[attr-defined]
+            except Exception as exc:
+                raise RuntimeError(f"Nao foi possivel abrir o navegador padrao: {exc}") from exc
+        time.sleep(float(self.cfg.get("timing", {}).get("browser_photo_load", 2.8)))
+
+    def _load_photo_from_local_browser_or_http(
+        self, url: str
+    ) -> tuple[Optional[Image.Image], str]:
+        local_url = urlparse.quote(url, safe=":/?&=%#@+;,[]")
+        download_error = ""
+
+        try:
+            req = urlrequest.Request(
+                local_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                    )
+                },
+            )
+            with urlrequest.urlopen(req, timeout=30) as response:
+                raw = response.read()
+            photo = Image.open(BytesIO(raw))
+            photo.load()
+            return photo.convert("RGB"), "download_http"
+        except Exception as exc:
+            download_error = str(exc)
+
+        try:
+            active = active_window_title().lower()
+            if self.remote_title.lower() not in active:
+                pyautogui.hotkey("alt", "space")
+                time.sleep(0.15)
+                pyautogui.press("x")
+                time.sleep(0.6)
+
+            screen = pyautogui.screenshot()
+            candidate, _, cropped = extract_largest_photo_from_screen(
+                screen,
+                [0.00, 0.05, 1.00, 0.90],
+                min_area_ratio=0.012,
+            )
+            if cropped and candidate.width >= 160 and candidate.height >= 160:
+                return candidate.convert("RGB"), "captura_navegador"
+        except Exception as exc:
+            download_error = f"{download_error}; captura: {exc}"
+
+        return None, download_error
+
+    def _process_url_from_notepad(
         self,
         obra: str,
-        target: Dict,
+        index: int,
+        total: int,
         url: str,
         obra_dir: Path,
     ) -> dict:
-        """Abre o link no navegador LOCAL, baixa a imagem e executa OCR local."""
-        key = str(target.get("key", "FOTO"))
-        suffix = str(target.get("output_suffix") or key)
+        self._open_url_from_txt_in_default_browser(obra, index, total, url)
 
-        # URLs exibidas no SAP podem conter espacos literais.
-        local_url = urlparse.quote(url, safe=":/?&=%#@+;,[]")
+        photo, source = self._load_photo_from_local_browser_or_http(url)
+        is_facade = self._is_facade_url(url)
+        filename = self._safe_photo_filename(url, index)
+        out_file = self._unique_photo_path(obra_dir, filename)
 
-        self.emit(f"Obra {obra}: abrindo {key} no navegador local...")
-        try:
-            webbrowser.open(local_url, new=2, autoraise=True)
-        except Exception:
-            # Abrir visualmente e util, mas nao deve impedir o download automatico.
-            pass
-
-        req = urlrequest.Request(
-            local_url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-                )
-            },
-        )
-
-        raw = None
-        download_error = None
-        try:
-            with urlrequest.urlopen(req, timeout=30) as response:
-                raw = response.read()
-        except Exception as exc:
-            download_error = exc
-
-        photo: Optional[Image.Image] = None
-        if raw:
-            try:
-                photo = Image.open(BytesIO(raw))
-                photo.load()
-                photo = photo.convert("RGB")
-            except Exception as exc:
-                download_error = exc
-                photo = None
-
-        # Fallback: se o browser local conseguiu abrir, mas o HTTP do Python nao
-        # (por exemplo, autenticacao/certificado corporativo), tenta capturar a
-        # foto diretamente da janela local atualmente ativa.
-        if photo is None:
-            time.sleep(2.5)
-            active = active_window_title().lower()
-            if self.remote_title.lower() not in active:
-                local_screen = pyautogui.screenshot()
-                candidate, _, cropped = extract_largest_photo_from_screen(
-                    local_screen,
-                    [0.00, 0.05, 1.00, 0.90],
-                    min_area_ratio=0.015,
-                )
-                if cropped and candidate.width >= 180 and candidate.height >= 180:
-                    photo = candidate.convert("RGB")
+        result = {
+            "latitude": None,
+            "longitude": None,
+            "ocr_text": "",
+            "variant": "",
+        }
 
         if photo is None:
-            raise RuntimeError(
-                f"O link {key} foi copiado corretamente, mas o PC local nao "
-                f"conseguiu carregar a imagem. URL: {url}. Erro: {download_error}. "
-                "Abra esse endereco manualmente no navegador local. Se ele nao abrir, "
-                "o dominio .corp provavelmente so e acessivel dentro do ambiente remoto "
-                "ou exige autenticacao/VPN local."
-            )
+            return {
+                "path": None,
+                "url": url,
+                "filename": filename,
+                "is_facade": is_facade,
+                "source": source,
+                **result,
+            }
 
-        out_file = obra_dir / f"{obra}_{suffix}.jpg"
         photo.save(out_file, quality=95)
-        if "FACHADA" in key.upper():
-            photo.save(obra_dir / f"{obra}.jpg", quality=95)
 
-        result = extract_coordinates_from_photo(
-            photo,
-            lang=self.lang,
-            prefer_negative_lat=bool(
-                self.cfg.get("ocr", {}).get("prefer_negative_latitude", True)
-            ),
-        )
+        # Somente a FACHADA DO IMOVEL passa pelo OCR de coordenadas.
+        if is_facade:
+            result = extract_coordinates_from_photo(
+                photo,
+                lang=self.lang,
+                prefer_negative_lat=bool(
+                    self.cfg.get("ocr", {}).get("prefer_negative_latitude", True)
+                ),
+            )
+            photo.save(obra_dir / f"{obra}_FACHADADOIMOVEL.jpg", quality=95)
+            photo.save(obra_dir / f"{obra}.jpg", quality=95)
 
         if self.cfg.get("ocr", {}).get("save_debug_images", True):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            photo.save(
-                self.debug_root / f"{obra}_{suffix}_local_{stamp}.jpg",
-                quality=90,
-            )
-            meta = {
-                "url_copiada": url,
-                "url_local": local_url,
-                "latitude": result.get("latitude"),
-                "longitude": result.get("longitude"),
-                "variant": result.get("variant"),
-                "ocr_text": result.get("ocr_text", ""),
-            }
-            (self.debug_root / f"{obra}_{suffix}_local_{stamp}.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            try:
+                photo.save(self.debug_root / f"{obra}_{index:03d}_{stamp}.jpg", quality=88)
+            except Exception:
+                pass
 
-        # Fecha a aba local somente quando ela esta efetivamente em primeiro plano.
         try:
             active = active_window_title().lower()
             if active and self.remote_title.lower() not in active:
                 pyautogui.hotkey("ctrl", "w")
-                time.sleep(0.35)
+                time.sleep(0.30)
         except Exception:
             pass
-
-        self._activate_remote()
 
         return {
             "path": out_file,
             "url": url,
+            "filename": filename,
+            "is_facade": is_facade,
+            "source": source,
             **result,
         }
 
@@ -614,97 +687,120 @@ class SAPPhotoBot:
     def process_work(self, obra: str, work_index: int = 0, total_works: int = 1) -> dict:
         obra = "".join(ch for ch in str(obra).strip() if ch.isdigit())
         if not obra:
-            raise ValueError("Número de obra vazio ou inválido.")
+            raise ValueError("Numero de obra vazio ou invalido.")
 
         obra_dir = self.output_root / obra
         obra_dir.mkdir(parents=True, exist_ok=True)
         records: list[dict] = []
-        targets = [dict(item) for item in FIXED_TARGETS]
-        total_steps = max(1, total_works * (3 + len(targets) * 4))
-        base_step = work_index * (3 + len(targets) * 4)
 
         try:
-            self.emit(f"Obra {obra}: iniciando.", progress=base_step / total_steps)
+            self.emit(f"Obra {obra}: iniciando.", progress=0.02)
             self._prepare_remote_for_automation()
             self._enter_note(obra)
-            self.emit(f"Obra {obra}: nota aberta.", progress=(base_step + 1) / total_steps)
+            self.emit(f"Obra {obra}: nota aberta.", progress=0.10)
+
             self._open_images_tab()
-            self.emit(f"Obra {obra}: Imagens de Campo aberta.", progress=(base_step + 2) / total_steps)
+            self.emit(f"Obra {obra}: Imagens de Campo aberta.", progress=0.18)
 
-            # Primeiro copia os links da Area Remota para o clipboard local.
-            # A partir daqui as fotos sao abertas/processadas no proprio PC.
-            copied_urls = self._collect_target_urls_from_remote(obra)
+            # 1) Copia TODOS os links da grade SAP remota.
+            all_urls = self._collect_all_urls_from_remote(obra)
+            self.emit(
+                f"Obra {obra}: coleta concluida com {len(all_urls)} link(s).",
+                level="success",
+                progress=0.32,
+            )
 
-            for ti, target in enumerate(targets):
-                tkey = target.get("key", f"FOTO_{ti + 1}")
-                step0 = base_step + 3 + ti * 4
-                url = copied_urls.get(tkey, "")
+            # 2) Cria um bloco de notas com todos os links, um por linha.
+            txt_path = self._create_links_notepad(obra, obra_dir, all_urls)
 
-                if not url:
-                    records.append({
-                        "OBRA": obra,
-                        "TIPO_FOTO": tkey,
-                        "LINK_IDENTIFICADO_OCR": "",
-                        "LATITUDE": "",
-                        "LONGITUDE": "",
-                        "ARQUIVO_FOTO": "",
-                        "STATUS_LINK": "NAO COPIADO",
-                        "STATUS_COORDENADA": "NAO PROCESSADA",
-                        "OCR_RODAPE": "",
-                        "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                    })
-                    self.emit(
-                        f"Obra {obra}: link {tkey} nao foi encontrado entre as URLs copiadas.",
-                        level="warning",
-                        progress=(step0 + 1) / total_steps,
-                    )
-                    continue
+            # 3) O TXT passa a ser a fonte: abre um link por vez no navegador local.
+            urls_from_txt = self._read_links_from_notepad_file(txt_path)
+            total = len(urls_from_txt)
+            facade_found = False
+            facade_lat = None
+            facade_lon = None
 
+            for index, url in enumerate(urls_from_txt, start=1):
+                progress = 0.32 + (0.58 * (index - 1) / max(1, total))
                 self.emit(
-                    f"Obra {obra}: processando imagem {ti + 1}/{len(targets)} no PC local...",
-                    progress=step0 / total_steps,
+                    f"Obra {obra}: processando link {index}/{total} do bloco de notas...",
+                    progress=progress,
                 )
 
                 try:
-                    photo_result = self._download_photo_local(
-                        obra,
-                        target,
-                        url,
-                        obra_dir,
+                    photo_result = self._process_url_from_notepad(
+                        obra, index, total, url, obra_dir
                     )
-                    lat = photo_result.get("latitude")
-                    lon = photo_result.get("longitude")
-                    coord_status = (
-                        "OK"
-                        if lat is not None and lon is not None
-                        else "COORDENADA NAO RECONHECIDA"
-                    )
+
+                    is_facade = bool(photo_result.get("is_facade"))
+                    path = photo_result.get("path")
+                    lat = photo_result.get("latitude") if is_facade else None
+                    lon = photo_result.get("longitude") if is_facade else None
+
+                    if is_facade:
+                        facade_found = True
+                        facade_lat = lat
+                        facade_lon = lon
+
+                    status_link = "SALVO" if path else "ERRO AO SALVAR"
+                    if is_facade:
+                        coord_status = (
+                            "OK"
+                            if lat is not None and lon is not None
+                            else "COORDENADA NAO RECONHECIDA"
+                        )
+                    else:
+                        coord_status = "NAO APLICAVEL - SOMENTE FACHADA"
+
                     records.append({
                         "OBRA": obra,
-                        "TIPO_FOTO": tkey,
+                        "ORDEM": index,
+                        "TIPO_FOTO": (
+                            "FACHADADOIMOVEL"
+                            if is_facade
+                            else photo_result.get("filename", f"FOTO_{index:03d}")
+                        ),
                         "LINK_IDENTIFICADO_OCR": url,
                         "LATITUDE": lat if lat is not None else "",
                         "LONGITUDE": lon if lon is not None else "",
-                        "ARQUIVO_FOTO": str(photo_result["path"]),
-                        "STATUS_LINK": "COPIADO/LOCAL",
+                        "ARQUIVO_FOTO": str(path) if path else "",
+                        "STATUS_LINK": status_link,
                         "STATUS_COORDENADA": coord_status,
-                        "OCR_RODAPE": photo_result.get("ocr_text", ""),
+                        "OCR_RODAPE": photo_result.get("ocr_text", "") if is_facade else "",
+                        "ARQUIVO_LINKS": str(txt_path),
                         "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                     })
-                    if coord_status == "OK":
+
+                    if path:
                         self.emit(
-                            f"Obra {obra}: {tkey} salvo; coordenada {lat:.6f}, {lon:.6f}.",
+                            f"Obra {obra}: foto {index}/{total} salva em {Path(path).name}.",
                             level="success",
                         )
                     else:
                         self.emit(
-                            f"Obra {obra}: {tkey} salvo, mas a coordenada nao foi reconhecida.",
+                            f"Obra {obra}: link {index}/{total} abriu, mas a foto nao foi salva.",
                             level="warning",
                         )
+
+                    if is_facade:
+                        if lat is not None and lon is not None:
+                            self.emit(
+                                f"Obra {obra}: coordenada da FACHADA DO IMOVEL = "
+                                f"{lat:.6f}, {lon:.6f}.",
+                                level="success",
+                            )
+                        else:
+                            self.emit(
+                                f"Obra {obra}: FACHADA DO IMOVEL salva, mas a coordenada "
+                                "nao foi reconhecida.",
+                                level="warning",
+                            )
+
                 except Exception as exc:
                     records.append({
                         "OBRA": obra,
-                        "TIPO_FOTO": tkey,
+                        "ORDEM": index,
+                        "TIPO_FOTO": "",
                         "LINK_IDENTIFICADO_OCR": url,
                         "LATITUDE": "",
                         "LONGITUDE": "",
@@ -712,14 +808,21 @@ class SAPPhotoBot:
                         "STATUS_LINK": "ERRO LOCAL",
                         "STATUS_COORDENADA": "NAO PROCESSADA",
                         "OCR_RODAPE": "",
+                        "ARQUIVO_LINKS": str(txt_path),
                         "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                     })
                     self.emit(
-                        f"Obra {obra}: falha ao processar {tkey} no PC local: {exc}",
+                        f"Obra {obra}: erro no link {index}/{total}: {exc}",
                         level="error",
                     )
                     if not self.cfg.get("automation", {}).get("continue_when_photo_missing", True):
                         raise
+
+            if not facade_found:
+                self.emit(
+                    f"Obra {obra}: nenhuma URL de FACHADA DO IMOVEL foi encontrada no bloco de notas.",
+                    level="warning",
+                )
 
             excel_path = save_work_excel(records, obra_dir / f"{obra}_coordenadas.xlsx")
             if self.cfg.get("output", {}).get("create_consolidated_excel", True):
@@ -732,26 +835,32 @@ class SAPPhotoBot:
                 zip_path = Path(zip_result)
 
             self.emit(
-                f"Obra {obra}: processamento concluído.",
+                f"Obra {obra}: processamento concluido. "
+                f"{len(all_urls)} link(s), {len(records)} registro(s).",
                 level="success",
-                progress=min(1.0, (base_step + 3 + len(targets) * 4) / total_steps),
+                progress=1.0,
             )
+
             return {
                 "obra": obra,
                 "folder": obra_dir,
                 "excel": excel_path,
+                "links_txt": txt_path,
                 "zip": zip_path,
                 "records": records,
+                "fachada_latitude": facade_lat,
+                "fachada_longitude": facade_lon,
                 "ok": True,
             }
 
         except pyautogui.FailSafeException as exc:
             self._error_screenshot(obra, "FAILSAFE")
             self.emit(
-                f"Obra {obra}: execução interrompida pelo FAILSAFE (mouse no canto superior esquerdo).",
+                f"Obra {obra}: execucao interrompida pelo FAILSAFE "
+                "(mouse no canto superior esquerdo).",
                 level="error",
             )
-            raise RuntimeError("Automação interrompida pelo usuário (FAILSAFE).") from exc
+            raise RuntimeError("Automacao interrompida pelo usuario (FAILSAFE).") from exc
         except Exception:
             self._error_screenshot(obra, "PROCESSAMENTO")
             raise
