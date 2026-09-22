@@ -14,12 +14,15 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 from datetime import datetime
+from collections import Counter
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
 
 import pyautogui
 import pyperclip
-from PIL import Image
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .config import APP_DIR, resolve_output_root
 from .excel_utils import save_work_excel, update_consolidated
@@ -349,135 +352,293 @@ class SAPPhotoBot:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
 
-    def _copy_url_from_link_row(
-        self,
-        y_abs: int,
-        grid_region_abs: tuple[int, int, int, int],
-    ) -> str:
-        """Copia uma URL da grade SAP sem abrir o link.
+    # ------------------------------------------------------------------
+    # COLETA DE LINKS POR PRINT TEMPORARIO + OCR
+    # ------------------------------------------------------------------
+    # Esta versao NAO depende do clipboard do RDP. A grade Links e capturada
+    # como imagem, ampliada e lida pelo Tesseract. Os prints sao temporarios e
+    # apagados depois que o TXT da obra e montado com sucesso.
 
-        Usa o modo de selecao em bloco do SAP GUI (Ctrl+Y), arrasta somente a
-        linha desejada e envia Ctrl+C. Com o clipboard redirecionado pelo RDP,
-        o texto passa a ficar disponivel no Windows local.
-        """
-        self._activate_remote()
-        _clear_windows_clipboard()
+    _KNOWN_PHOTO_LABELS = (
+        "NUMEROPOSTECONEXAOCLIENT",
+        "ADESIVOLIGACAONOVA",
+        "PADRAODEMEDICAO",
+        "IMOVELSEMREDE",
+        "FOTOPANORAMICA",
+        "FACHADADOIMOVEL",
+        "FACHADAIMOVEL",
+        "MEDIDORVIZINHOESQUERDO",
+        "MEDIDORVIZINHODIREITO",
+        "NUMEROTRANSFORMADOR",
+        "FORMULARIODEREJEICAO",
+    )
 
-        left, top, width, height = grid_region_abs
-        # Evita a borda/scrollbar, mas cobre praticamente a URL inteira.
-        x1 = left + max(10, int(width * 0.015))
-        x2 = left + width - max(25, int(width * 0.025))
-        y = int(y_abs)
+    _PHOTO_BASE_URL = (
+        "https://eapspddope01.equatorial.corp/ma/barramento/EQTL_MA"
+    )
 
-        # Ctrl+Y e o atalho classico do SAP GUI para selecionar texto em bloco.
-        pyautogui.hotkey("ctrl", "y")
-        time.sleep(0.20)
-        pyautogui.moveTo(x1, y, duration=0.15)
-        pyautogui.dragTo(x2, y, duration=0.70, button="left")
-        time.sleep(0.15)
-        pyautogui.hotkey("ctrl", "c")
+    def _normalize_ocr_photo_label(self, raw: str) -> str:
+        """Normaliza/corrige o nome final do JPG reconhecido pelo OCR."""
+        value = re.sub(r"[^A-Z0-9]", "", str(raw or "").upper())
+        if not value:
+            return ""
 
-        deadline = time.time() + 2.5
-        copied = ""
-        while time.time() < deadline:
-            copied = _read_windows_clipboard_text().strip()
-            if copied:
-                break
-            time.sleep(0.10)
+        # Tesseract costuma confundir I/V/T/L em palavras longas. Como os
+        # nomes mais comuns das fotos sao padronizados no SAP, fazemos uma
+        # correcao fuzzy apenas quando a semelhanca e alta.
+        best = value
+        best_score = 0.0
+        for candidate in self._KNOWN_PHOTO_LABELS:
+            score = SequenceMatcher(None, value, candidate).ratio()
+            if score > best_score:
+                best = candidate
+                best_score = score
 
-        # Sai de eventual modo de selecao sem ativar o hyperlink.
-        pyautogui.press("esc")
-        time.sleep(0.10)
+        if best_score >= 0.78:
+            return best
+        return value
 
-        return _extract_http_url(copied)
-
-    def _collect_all_urls_from_remote(self, obra: str) -> list[str]:
-        """Copia TODOS os links da grade Imagens de Campo.
-
-        O robo percorre a grade por paginas/rolagem, usa Ctrl+Y + Ctrl+C em
-        cada linha e acumula URLs unicas. A Area Remota e usada somente para
-        esta coleta. Depois disso o processamento ocorre no computador local.
-        """
-        self._activate_remote()
-        time.sleep(0.40)
-
-        region_norm = (0.012, 0.285, 0.615, 0.245)
-        urls: list[str] = []
-        seen: set[str] = set()
-
-        row_centers, debug_img, region_abs = detect_link_row_centers(
-            window_title=self.remote_title,
-            region_norm=region_norm,
+    def _ocr_grid_text_variants(self, image: Image.Image) -> list[str]:
+        """Executa OCR da grade Links com mais de um tratamento visual."""
+        # Ampliacao e importante: na tela SAP a fonte do link e pequena.
+        scale = 3
+        enlarged = image.resize(
+            (image.width * scale, image.height * scale),
+            Image.Resampling.LANCZOS,
         )
-        self._save_ocr_debug(obra, "LINKS", debug_img, "inicio_coleta")
+        gray = ImageOps.grayscale(enlarged)
+        contrast = ImageEnhance.Contrast(gray).enhance(2.0)
+        sharp = contrast.filter(ImageFilter.SHARPEN)
 
-        left, top, width, height = region_abs
-        grid_x = left + max(40, width // 2)
-        grid_y = top + max(40, height // 2)
+        variants = [gray, contrast, sharp]
+        texts: list[str] = []
+        for variant in variants:
+            for psm in (6, 4):
+                try:
+                    text = pytesseract.image_to_string(
+                        variant,
+                        lang=self.lang,
+                        config=f"--psm {psm}",
+                    )
+                except Exception:
+                    text = pytesseract.image_to_string(
+                        variant,
+                        lang="eng",
+                        config=f"--psm {psm}",
+                    )
+                if text and text.strip():
+                    texts.append(text)
+        return texts
 
-        # Comeca no topo da lista.
-        pyautogui.moveTo(grid_x, grid_y, duration=0.15)
-        for _ in range(6):
-            pyautogui.scroll(10)
-            time.sleep(0.08)
+    def _pick_common_month_and_date(self, texts: list[str]) -> tuple[str, str]:
+        """Descobre pasta AAAAMM e data AAAAMMDD pela maioria dos OCRs."""
+        months: list[str] = []
+        dates: list[str] = []
+        for text in texts:
+            # Mantem os espacos entre campos numericos. Remover esses espacos
+            # faria 20260717 + numero da obra virarem um numero unico.
+            months.extend(re.findall(r"(?<!\d)(20\d{4})(?!\d)", text))
+            dates.extend(re.findall(r"(?<!\d)(20\d{6})(?!\d)", text))
+
+        month = Counter(months).most_common(1)[0][0] if months else ""
+        date = Counter(dates).most_common(1)[0][0] if dates else ""
+
+        if not month and date:
+            month = date[:6]
+        return month, date
+
+    def _parse_ocr_link_rows(self, texts: list[str], obra: str) -> list[str]:
+        """Reconstrui URLs exatas a partir das linhas OCR da grade SAP.
+
+        O Tesseract geralmente converte '_' para espaco. Em vez de confiar na
+        URL inteira reconhecida, usamos o formato padrao do repositorio de
+        fotos e reconstruimos cada link com os campos visiveis da linha.
+        """
+        month, photo_date = self._pick_common_month_and_date(texts)
+        if not month or not photo_date:
+            return []
+
+        found: dict[tuple[int, str], str] = {}
+
+        for text in texts:
+            for raw_line in text.splitlines():
+                line = str(raw_line or "").strip()
+                if not line:
+                    continue
+
+                upper = line.upper()
+                # Ignora textos que claramente nao sao linhas de link.
+                if (
+                    "EQUATORIAL" not in upper
+                    and "EQ FOTO" not in upper
+                    and "EQ_FOTO" not in upper
+                    and " FOTO " not in f" {upper} "
+                ):
+                    continue
+
+                # Normaliza algumas leituras frequentes de FOTO.
+                work = upper.replace("F0T0", "FOTO").replace("F0TO", "FOTO")
+                work = work.replace("FOT0", "FOTO")
+
+                # Procura o numero apos FOTO. O prefixo EQ pode ou nao ter sido
+                # reconhecido pelo OCR, entao o regex e propositalmente amplo.
+                matches = list(re.finditer(r"FOTO\s*[_\- ]*\s*(\d{1,3})\s+", work))
+                if not matches:
+                    continue
+                m = matches[-1]
+                photo_number = int(m.group(1))
+
+                tail = work[m.end():]
+                # Termina no .JPG quando OCR o reconheceu; senao usa a cauda.
+                tail = re.split(r"\.\s*JPG|\bJPG\b", tail, maxsplit=1)[0]
+                label = self._normalize_ocr_photo_label(tail)
+                if not label:
+                    continue
+
+                url = (
+                    f"{self._PHOTO_BASE_URL}/{month}/"
+                    f"OFS_PHOTO_{photo_date}_{obra}_EQ_FOTO_{photo_number}_{label}.jpg"
+                )
+                found[(photo_number, label)] = url
+
+        # Ordena pela ordem visual mais comum (numero da foto) apenas para
+        # manter o TXT previsivel. Todas as URLs unicas sao preservadas.
+        return [found[key] for key in sorted(found, key=lambda x: (x[0], x[1]))]
+
+    def _capture_links_grid_temp(
+        self,
+        obra: str,
+        page: int,
+        temp_dir: Path,
+        region_norm: tuple[float, float, float, float],
+    ) -> tuple[Image.Image, tuple[int, int, int, int]]:
+        """Tira um print TEMPORARIO somente da grade Links."""
+        full, remote_abs = screenshot_window_contains(
+            self.remote_title,
+            content_only=False,
+        )
+        rw, rh = full.size
+        rx, ry, rwidth, rheight = region_norm
+        x = max(0, int(round(rx * rw)))
+        y = max(0, int(round(ry * rh)))
+        w = max(1, int(round(rwidth * rw)))
+        h = max(1, int(round(rheight * rh)))
+        x2 = min(rw, x + w)
+        y2 = min(rh, y + h)
+        crop = full.crop((x, y, x2, y2))
+
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_file = temp_dir / f"pagina_{page:02d}.png"
+        crop.save(temp_file)
+
+        abs_region = (
+            remote_abs[0] + x,
+            remote_abs[1] + y,
+            crop.width,
+            crop.height,
+        )
+        return crop, abs_region
+
+    def _collect_all_urls_from_remote(self, obra: str, obra_dir: Path) -> list[str]:
+        """Extrai TODOS os links usando prints temporarios da grade + OCR.
+
+        Fluxo:
+            1. ativa o RDP e posiciona a grade no topo;
+            2. tira print temporario da grade Links;
+            3. OCR + reconstrucao das URLs;
+            4. rola a grade e repete ate nao aparecerem links novos;
+            5. apaga os prints temporarios depois do sucesso.
+
+        Nao usa Ctrl+C, Ctrl+Y nem clipboard do RDP.
+        """
+        self._activate_remote()
         time.sleep(0.50)
 
+        # Regiao relativa a janela RDP. Abrange o quadro Links completo sem
+        # pegar as abas superiores. Foi ajustada para a tela SAP 1920x1080,
+        # mas continua proporcional caso o RDP tenha outro tamanho.
+        region_norm = (0.015, 0.300, 0.625, 0.310)
+        temp_dir = obra_dir / "_temp_links_ocr"
+
+        # Leva a lista para o topo antes da primeira captura.
+        left, top, width, height = get_window_region_contains(
+            self.remote_title,
+            content_only=False,
+        )
+        grid_x = left + int(width * (region_norm[0] + region_norm[2] * 0.50))
+        grid_y = top + int(height * (region_norm[1] + region_norm[3] * 0.50))
+        pyautogui.moveTo(grid_x, grid_y, duration=0.15)
+        for _ in range(8):
+            pyautogui.scroll(10)
+            time.sleep(0.06)
+        time.sleep(0.45)
+
+        urls: list[str] = []
+        seen: set[str] = set()
         max_pages = int(self.cfg.get("automation", {}).get("max_link_pages", 15))
         pages_without_new = 0
 
-        for page in range(max_pages):
-            row_centers, debug_img, region_abs = detect_link_row_centers(
-                window_title=self.remote_title,
-                region_norm=region_norm,
-            )
-
-            if page == 0 or self.cfg.get("ocr", {}).get("save_debug_images", True):
-                self._save_ocr_debug(
-                    obra, "LINKS", debug_img, f"pagina_{page + 1}"
+        try:
+            for page in range(1, max_pages + 1):
+                image, abs_region = self._capture_links_grid_temp(
+                    obra,
+                    page,
+                    temp_dir,
+                    region_norm,
                 )
 
-            left, top, width, height = region_abs
+                texts = self._ocr_grid_text_variants(image)
+                page_urls = self._parse_ocr_link_rows(texts, obra)
 
-            if len(row_centers) < 3:
-                first_y = top + int(height * 0.10)
-                spacing = max(19, int(height * 0.087))
-                row_centers = [first_y + i * spacing for i in range(12)]
+                before = len(urls)
+                for url in page_urls:
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    urls.append(url)
+                    self.emit(
+                        f"Obra {obra}: link {len(urls)} identificado pelo print temporario.",
+                        level="success",
+                    )
 
-            before = len(urls)
+                if len(urls) == before:
+                    pages_without_new += 1
+                else:
+                    pages_without_new = 0
 
-            for y in sorted(row_centers):
-                url = self._copy_url_from_link_row(y, region_abs)
-                if not url:
-                    continue
-                url = url.strip()
-                if url in seen:
-                    continue
-                seen.add(url)
-                urls.append(url)
                 self.emit(
-                    f"Obra {obra}: link {len(urls)} copiado da Area Remota.",
-                    level="success",
+                    f"Obra {obra}: pagina {page} da grade analisada; "
+                    f"{len(page_urls)} link(s) reconhecido(s) nesta pagina."
                 )
 
-            if len(urls) == before:
-                pages_without_new += 1
-            else:
-                pages_without_new = 0
+                # Duas paginas consecutivas sem novidade indicam fim da lista.
+                if pages_without_new >= 2:
+                    break
 
-            if pages_without_new >= 2:
-                break
+                # Rola somente dentro da propria grade Links.
+                ax, ay, aw, ah = abs_region
+                pyautogui.moveTo(ax + aw // 2, ay + ah // 2, duration=0.10)
+                pyautogui.scroll(-7)
+                time.sleep(0.65)
 
-            pyautogui.moveTo(left + width // 2, top + height // 2, duration=0.10)
-            pyautogui.scroll(-7)
-            time.sleep(0.65)
+            if not urls:
+                raise RuntimeError(
+                    "Nenhum link foi reconhecido nos prints temporarios da grade Links. "
+                    "Os prints foram mantidos na pasta _temp_links_ocr para diagnostico."
+                )
 
-        if not urls:
-            raise RuntimeError(
-                "Nenhum link conseguiu ser copiado da grade. Verifique se o "
-                "redirecionamento da Area de Transferencia/Clipboard esta habilitado no RDP."
-            )
+            # O usuario pediu prints apenas temporarios. Mantemos ate concluir a
+            # leitura e, em caso de sucesso, removemos a pasta inteira.
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
-        return urls
+            return urls
+
+        except Exception:
+            # Em erro, NAO apaga os prints: eles ajudam a diagnosticar o OCR.
+            raise
 
     def _create_links_notepad(self, obra: str, obra_dir: Path, urls: list[str]) -> Path:
         """Cria o bloco de notas da obra com um link por linha e o abre."""
@@ -703,7 +864,7 @@ class SAPPhotoBot:
             self.emit(f"Obra {obra}: Imagens de Campo aberta.", progress=0.18)
 
             # 1) Copia TODOS os links da grade SAP remota.
-            all_urls = self._collect_all_urls_from_remote(obra)
+            all_urls = self._collect_all_urls_from_remote(obra, obra_dir)
             self.emit(
                 f"Obra {obra}: coleta concluida com {len(all_urls)} link(s).",
                 level="success",
