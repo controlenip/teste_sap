@@ -713,6 +713,126 @@ def locate_link_row_robust(
 
 
 
+
+
+def locate_link_row_fullscreen(
+    targets: Sequence[str],
+    *,
+    lang: str = "eng",
+    threshold: float = 58,
+) -> tuple[Optional[OCRLine], Image.Image, tuple[int, int, int, int]]:
+    """Localiza uma foto na grade Links usando a TELA INTEIRA local.
+
+    Esta rotina foi criada para o cenário confirmado pelo usuário: o RDP está
+    em tela cheia e a resolução local é 1920x1080. Assim, evitamos qualquer
+    diferença de coordenadas causada pela moldura/título da janela RDP.
+
+    O OCR é feito somente na região onde a grade Links aparece. O retorno usa
+    coordenadas absolutas do monitor, prontas para clique.
+    """
+    import pyautogui
+
+    sw, sh = pyautogui.size()
+    full = pyautogui.screenshot()
+
+    # Região observada nos prints reais 1920x1080. Mantemos proporcionalidade
+    # caso o Windows reporte pequenas diferenças de escala/resolução.
+    rx, ry, rw, rh = (0.012, 0.270, 0.615, 0.320)
+    x = max(0, int(round(sw * rx)))
+    y = max(0, int(round(sh * ry)))
+    w = max(1, min(sw - x, int(round(sw * rw))))
+    h = max(1, min(sh - y, int(round(sh * rh))))
+    region_abs = (x, y, w, h)
+    image = full.crop((x, y, x + w, y + h))
+
+    target_norms = [
+        normalize_text(str(t).replace(".JPG", "").replace(".jpg", ""))
+        for t in targets
+        if str(t).strip()
+    ]
+
+    # Variantes que funcionaram melhor nos prints enviados.
+    variants: list[tuple[Image.Image, float]] = [(image, 1.0)]
+    gray = ImageOps.grayscale(image)
+    gray = ImageEnhance.Contrast(gray).enhance(2.0)
+    gray = gray.filter(ImageFilter.SHARPEN)
+
+    for scale in (2.5, 3.5, 4.5):
+        big = gray.resize(
+            (
+                max(1, int(round(gray.width * scale))),
+                max(1, int(round(gray.height * scale))),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+        variants.append((big, scale))
+
+    best: Optional[OCRLine] = None
+    best_score = -1.0
+
+    for variant, scale in variants:
+        for psm in (6, 11):
+            df = _image_to_data(variant, lang=lang, psm=psm)
+            if df.empty:
+                continue
+
+            for _, grp in df.groupby(["block_num", "par_num", "line_num"], sort=False):
+                words = [
+                    str(t).strip()
+                    for t in grp["text"].tolist()
+                    if str(t).strip()
+                ]
+                if not words:
+                    continue
+
+                line_text = " ".join(words)
+                line_norm = normalize_text(line_text)
+                if not line_norm:
+                    continue
+
+                score = -1.0
+                for target_norm in target_norms:
+                    if not target_norm:
+                        continue
+                    if target_norm in line_norm:
+                        candidate = 100.0
+                    else:
+                        candidate = max(
+                            float(fuzz.partial_ratio(target_norm, line_norm)),
+                            float(fuzz.ratio(target_norm, line_norm)),
+                        )
+                    score = max(score, candidate)
+
+                if score < threshold or score <= best_score:
+                    continue
+
+                left = int(grp["left"].min())
+                top = int(grp["top"].min())
+                right = int((grp["left"] + grp["width"]).max())
+                bottom = int((grp["top"] + grp["height"]).max())
+
+                if scale != 1.0:
+                    left = int(round(left / scale))
+                    top = int(round(top / scale))
+                    right = int(round(right / scale))
+                    bottom = int(round(bottom / scale))
+
+                best_score = float(score)
+                best = OCRLine(
+                    line_text,
+                    x + left,
+                    y + top,
+                    max(1, right - left),
+                    max(1, bottom - top),
+                    float(score),
+                )
+
+        if best is not None and best.score >= 99.0:
+            break
+
+    return best, image, region_abs
+
+
 def detect_link_row_centers(
     *,
     window_title: str,
