@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pytesseract
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from rapidfuzz import fuzz
 
 from .config import norm_region_to_abs
