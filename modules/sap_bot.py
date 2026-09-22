@@ -20,6 +20,7 @@ from .vision import (
     locate_link_filename_on_screen,
     locate_link_row_robust,
     locate_link_row_strict,
+    locate_link_row_fullscreen,
     detect_link_row_centers,
     save_debug_image,
     wait_for_text,
@@ -355,30 +356,30 @@ class SAPPhotoBot:
         return False, ""
 
     def _locate_and_click_link(self, obra: str, target: Dict) -> tuple[bool, str]:
-        """Localiza e abre SOMENTE o link da foto solicitada.
+        """Localiza e abre o link exato da foto na grade Links.
 
-        Esta versao nao varre linhas e nao clica em links por tentativa. O OCR
-        identifica primeiro a linha exata pelo nome do JPG. Somente depois o
-        robo faz um unico clique naquela linha. Isso elimina o risco de abrir
-        menus como Efetuar logoff ou fechar a janela da ferramenta.
+        O RDP já está em tela cheia. Por isso esta versão faz OCR diretamente
+        sobre uma captura da tela local completa e usa a região fixa da grade
+        Links observada nos prints 1920x1080. Não depende mais da geometria da
+        janela RDP nem de offsets da barra de título.
         """
         aliases = target.get("aliases", [target.get("key", "")])
         key = target.get("key", "FOTO")
 
         self._activate_remote()
+        time.sleep(0.30)
 
-        found, debug_img, region_abs = locate_link_row_strict(
+        found, debug_img, region_abs = locate_link_row_fullscreen(
             aliases,
-            window_title=self.remote_title,
             lang=self.lang,
-            threshold=72,
+            threshold=56,
         )
 
         self._save_ocr_debug(
             obra,
             key,
             debug_img,
-            "busca_link_direta",
+            "busca_link_tela_cheia",
         )
 
         if not found:
@@ -388,93 +389,74 @@ class SAPPhotoBot:
             )
             return False, ""
 
-        # Y vem exatamente da linha reconhecida pelo OCR.
-        click_y = found.center[1]
+        # O OCR retorna a caixa da linha inteira. O centro dessa caixa fica
+        # necessariamente sobre a URL/hyperlink, portanto é mais seguro do
+        # que usar um X fixo.
+        click_x, click_y = found.center
 
-        # Clique em uma posicao segura dentro do texto da URL. A URL ocupa
-        # praticamente toda a linha; usamos ~220 px a partir do inicio da
-        # regiao da grade, longe do menu lateral do SAP.
-        click_x = region_abs[0] + min(
-            max(220, int(region_abs[2] * 0.18)),
-            max(240, region_abs[2] - 80),
-        )
+        # Mantém o clique dentro da grade, longe das barras/menu do SAP.
+        min_x = region_abs[0] + 40
+        max_x = region_abs[0] + region_abs[2] - 40
+        min_y = region_abs[1] + 15
+        max_y = region_abs[1] + region_abs[3] - 15
+        click_x = max(min_x, min(click_x, max_x))
+        click_y = max(min_y, min(click_y, max_y))
 
         self.emit(
-            f"Obra {obra}: {key} reconhecido na grade (score {found.score:.0f}). Clicando no link...",
+            (
+                f"Obra {obra}: {key} reconhecido na grade "
+                f"(score {found.score:.0f}) em X={click_x}, Y={click_y}. "
+                f"Clicando no hyperlink..."
+            ),
             level="success",
         )
 
         self._activate_remote()
-        pyautogui.moveTo(click_x, click_y, duration=0.18)
+        pyautogui.moveTo(click_x, click_y, duration=0.20)
         pyautogui.click()
 
-        # Aguarda o popup de seguranca. Se ele nao aparecer, faz apenas UMA
-        # segunda tentativa na mesma linha. Nunca varre outras linhas e nunca
-        # usa Alt+F4 nesta etapa.
         popup = wait_for_text(
-            ["Seguranca SAPGUI", "Segurança SAPGUI"],
+            ["Seguranca SAPGUI", "Segurança SAPGUI", "Permitir", "Rejeitar"],
             [0.15, 0.25, 0.70, 0.45],
             lang=self.lang,
-            threshold=38,
-            timeout=2.8,
+            threshold=34,
+            timeout=3.2,
             poll_interval=0.25,
             window_title=self.remote_title,
         )
 
         if not popup:
-            # Verifica se a grade ainda esta visivel. Se estiver, o primeiro
-            # clique provavelmente apenas selecionou/focou a linha.
-            still_links = wait_for_text(
-                ["Links"],
-                [0.00, 0.20, 0.72, 0.55],
+            # Alguns links exigem um segundo clique para ativação. Repetimos
+            # SOMENTE no mesmo ponto já validado pelo OCR.
+            self.emit(
+                f"Obra {obra}: primeiro clique nao abriu o popup; repetindo no mesmo hyperlink...",
+                level="warning",
+            )
+            pyautogui.moveTo(click_x, click_y, duration=0.12)
+            pyautogui.click()
+            popup = wait_for_text(
+                ["Seguranca SAPGUI", "Segurança SAPGUI", "Permitir", "Rejeitar"],
+                [0.15, 0.25, 0.70, 0.45],
                 lang=self.lang,
-                threshold=30,
-                timeout=0.8,
-                poll_interval=0.20,
+                threshold=34,
+                timeout=3.2,
+                poll_interval=0.25,
                 window_title=self.remote_title,
             )
 
-            if still_links:
-                pyautogui.moveTo(click_x, click_y, duration=0.12)
-                pyautogui.click()
-                popup = wait_for_text(
-                    ["Seguranca SAPGUI", "Segurança SAPGUI"],
-                    [0.15, 0.25, 0.70, 0.45],
-                    lang=self.lang,
-                    threshold=38,
-                    timeout=2.8,
-                    poll_interval=0.25,
-                    window_title=self.remote_title,
-                )
+        if not popup:
+            # Pode haver política que abre o navegador diretamente sem popup.
+            browser_ok, browser_text = self._browser_contains_target(aliases)
+            if browser_ok:
+                return True, browser_text or found.text
 
-        if popup:
-            # Deixa o popup aberto. _permit_if_needed() vai clicar Permitir.
-            return True, found.text
-
-        # Em alguns ambientes a decisao pode estar memorizada e o navegador
-        # abrir direto. Se a grade desapareceu, tratamos como link aberto.
-        still_links = wait_for_text(
-            ["Links"],
-            [0.00, 0.20, 0.72, 0.55],
-            lang=self.lang,
-            threshold=30,
-            timeout=0.7,
-            poll_interval=0.20,
-            window_title=self.remote_title,
-        )
-
-        if not still_links:
             self.emit(
-                f"Obra {obra}: {key} abriu sem popup de seguranca.",
-                level="success",
+                f"Obra {obra}: {key} foi reconhecido, mas o clique nao abriu o popup/foto.",
+                level="warning",
             )
-            return True, found.text
+            return False, found.text
 
-        self.emit(
-            f"Obra {obra}: {key} foi reconhecido, mas o link nao abriu apos dois cliques na mesma linha.",
-            level="warning",
-        )
-        return False, found.text
+        return True, found.text
 
     def _permit_if_needed(self):
         """Clica Permitir apenas quando o popup Segurança SAPGUI estiver presente.
