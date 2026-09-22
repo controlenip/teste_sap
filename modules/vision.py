@@ -429,6 +429,156 @@ def locate_link_filename_on_screen(
 
     return best, image, region_abs
 
+
+def locate_link_row_robust(
+    targets: Sequence[str],
+    *,
+    window_title: str,
+    lang: str = "eng",
+    threshold: float = 44,
+) -> tuple[Optional[OCRLine], Image.Image, tuple[int, int, int, int]]:
+    """Localiza uma das tres fotos-alvo na grade Links do SAP.
+
+    Esta rotina foi feita especificamente para a tela 1920x1080 enviada pelo
+    usuario. Ela evita OCR da URL inteira: captura somente a parte direita da
+    grade, amplia fortemente a imagem e procura o nome do JPG linha por linha.
+
+    O retorno de ``OCRLine`` ja usa coordenadas absolutas do monitor, de modo
+    que o chamador pode usar ``found.center[1]`` diretamente para clicar na
+    mesma linha do hyperlink.
+    """
+
+    # Primeira regiao: parte da grade em que aparecem os nomes dos arquivos.
+    # As demais sao fallback caso a escala do SAP varie alguns pixels.
+    regions = [
+        [0.30, 0.29, 0.32, 0.30],
+        [0.28, 0.285, 0.36, 0.31],
+        [0.20, 0.275, 0.44, 0.34],
+    ]
+
+    target_norms = [
+        normalize_text(t)
+        for t in targets
+        if str(t).strip()
+    ]
+
+    best: Optional[OCRLine] = None
+    best_score = -1.0
+    best_image: Optional[Image.Image] = None
+    best_region: Optional[tuple[int, int, int, int]] = None
+
+    for region_norm in regions:
+        image, region_abs = screenshot_norm_region(
+            region_norm,
+            window_title=window_title,
+        )
+
+        # O texto da grade e pequeno mesmo em 1920x1080. O upscale de 3.2x
+        # funcionou nos prints reais enviados pelo usuario.
+        scale = 3.2
+        gray = ImageOps.grayscale(image)
+        gray = ImageEnhance.Contrast(gray).enhance(2.0)
+        gray = gray.filter(ImageFilter.SHARPEN)
+        big = gray.resize(
+            (
+                max(1, int(round(gray.width * scale))),
+                max(1, int(round(gray.height * scale))),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+        arr = np.array(big)
+        _, bw190 = cv2.threshold(arr, 190, 255, cv2.THRESH_BINARY)
+        _, bw215 = cv2.threshold(arr, 215, 255, cv2.THRESH_BINARY)
+
+        variants = [
+            big,
+            Image.fromarray(bw190),
+            Image.fromarray(bw215),
+        ]
+
+        for variant in variants:
+            for psm in (6, 11):
+                df = _image_to_data(
+                    variant,
+                    lang=lang,
+                    psm=psm,
+                )
+
+                if df.empty:
+                    continue
+
+                # Tesseract normalmente separa cada URL como uma linha.
+                keys = ["block_num", "par_num", "line_num"]
+                for _, grp in df.groupby(keys, sort=False):
+                    words = [
+                        str(t).strip()
+                        for t in grp["text"].tolist()
+                        if str(t).strip()
+                    ]
+                    if not words:
+                        continue
+
+                    line_text = " ".join(words)
+                    line_norm = normalize_text(line_text)
+                    if not line_norm:
+                        continue
+
+                    score = -1.0
+                    for target_norm in target_norms:
+                        if not target_norm:
+                            continue
+
+                        if target_norm in line_norm:
+                            candidate = 100.0
+                        else:
+                            candidate = max(
+                                float(fuzz.partial_ratio(target_norm, line_norm)),
+                                float(fuzz.ratio(target_norm, line_norm)),
+                            )
+
+                        score = max(score, candidate)
+
+                    if score < threshold or score <= best_score:
+                        continue
+
+                    left = int(grp["left"].min())
+                    top = int(grp["top"].min())
+                    right = int((grp["left"] + grp["width"]).max())
+                    bottom = int((grp["top"] + grp["height"]).max())
+
+                    left = int(round(left / scale))
+                    top = int(round(top / scale))
+                    right = int(round(right / scale))
+                    bottom = int(round(bottom / scale))
+
+                    best_score = float(score)
+                    best = OCRLine(
+                        line_text,
+                        region_abs[0] + left,
+                        region_abs[1] + top,
+                        max(1, right - left),
+                        max(1, bottom - top),
+                        float(score),
+                    )
+                    best_image = image
+                    best_region = region_abs
+
+        # Se achou match exato, nao ha motivo para testar regioes maiores.
+        if best is not None and best.score >= 99.0:
+            break
+
+    if best is not None and best_image is not None and best_region is not None:
+        return best, best_image, best_region
+
+    # Mantem uma imagem de debug mesmo quando nao encontrar nada.
+    fallback_image, fallback_region = screenshot_norm_region(
+        regions[0],
+        window_title=window_title,
+    )
+    return None, fallback_image, fallback_region
+
+
 def _normalize_ocr_coord_text(text: str) -> str:
     s = str(text or "")
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
