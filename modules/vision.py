@@ -579,6 +579,87 @@ def locate_link_row_robust(
     return None, fallback_image, fallback_region
 
 
+
+def detect_link_row_centers(
+    *,
+    window_title: str,
+    region_norm: Sequence[float] = (0.01, 0.29, 0.63, 0.36),
+) -> tuple[list[int], Image.Image, tuple[int, int, int, int]]:
+    """Detecta as linhas visiveis da grade Links sem depender de OCR.
+
+    O SAP desenha cada URL em uma linha horizontal regular. Esta rotina usa
+    apenas densidade de pixels escuros para descobrir o centro Y de cada linha.
+    Isso e muito mais robusto do que tentar ler o nome pequeno do JPG na grade.
+
+    Retorna os centros Y em coordenadas absolutas do monitor, a captura usada
+    para diagnostico e a regiao absoluta da grade.
+    """
+    image, region_abs = screenshot_norm_region(
+        region_norm,
+        window_title=window_title,
+    )
+
+    gray = np.array(ImageOps.grayscale(image))
+    width = gray.shape[1]
+
+    def _bands_for_threshold(level: int) -> list[tuple[int, int, float]]:
+        # Mantem principalmente texto/underline escuro e ignora grande parte
+        # das linhas claras da grade.
+        mask = (gray < level).astype(np.uint8)
+        projection = mask.sum(axis=1).astype(np.float32)
+
+        # Suavizacao curta para unir partes de uma mesma linha de texto.
+        kernel = np.ones(3, dtype=np.float32) / 3.0
+        smooth = np.convolve(projection, kernel, mode="same")
+        min_pixels = max(8.0, width * 0.006)
+        ys = np.where(smooth > min_pixels)[0]
+
+        if len(ys) == 0:
+            return []
+
+        groups: list[tuple[int, int]] = []
+        start = prev = int(ys[0])
+        for raw_y in ys[1:]:
+            y = int(raw_y)
+            if y <= prev + 2:
+                prev = y
+            else:
+                groups.append((start, prev))
+                start = prev = y
+        groups.append((start, prev))
+
+        out: list[tuple[int, int, float]] = []
+        for a, b in groups:
+            height = b - a + 1
+            if height < 2 or height > 20:
+                continue
+            strength = float(smooth[a:b + 1].max())
+            if strength < min_pixels:
+                continue
+            out.append((a, b, strength))
+        return out
+
+    # Tenta limiares progressivamente mais permissivos.
+    bands: list[tuple[int, int, float]] = []
+    for level in (165, 180, 195):
+        candidate = _bands_for_threshold(level)
+        if len(candidate) >= 3:
+            bands = candidate
+            break
+        if len(candidate) > len(bands):
+            bands = candidate
+
+    centers_local = [int(round((a + b) / 2.0)) for a, b, _ in bands]
+
+    # Remove centros muito proximos/duplicados.
+    deduped: list[int] = []
+    for y in sorted(centers_local):
+        if not deduped or y - deduped[-1] >= 7:
+            deduped.append(y)
+
+    centers_abs = [region_abs[1] + y for y in deduped]
+    return centers_abs, image, region_abs
+
 def _normalize_ocr_coord_text(text: str) -> str:
     s = str(text or "")
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
