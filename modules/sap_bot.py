@@ -373,6 +373,20 @@ class SAPPhotoBot:
         "FORMULARIODEREJEICAO",
     )
 
+    _PHOTO_NUMBER_BY_LABEL = {
+        "FACHADADOIMOVEL": 11,
+        "FACHADAIMOVEL": 11,
+        "ADESIVOLIGACAONOVA": 2,
+        "PADRAODEMEDICAO": 30,
+        "IMOVELSEMREDE": 17,
+        "FOTOPANORAMICA": 42,
+        "NUMEROPOSTECONEXAOCLIENT": 26,
+        "MEDIDORVIZINHOESQUERDO": 25,
+        "MEDIDORVIZINHODIREITO": 24,
+        "NUMEROTRANSFORMADOR": 28,
+        "FORMULARIODEREJEICAO": 15,
+    }
+
     _PHOTO_BASE_URL = (
         "https://eapspddope01.equatorial.corp/ma/barramento/EQTL_MA"
     )
@@ -399,21 +413,25 @@ class SAPPhotoBot:
         return value
 
     def _ocr_grid_text_variants(self, image: Image.Image) -> list[str]:
-        """Executa OCR da grade Links com mais de um tratamento visual."""
-        # Ampliacao e importante: na tela SAP a fonte do link e pequena.
-        scale = 3
+        """Executa OCR da grade Links com mais de um tratamento visual.
+
+        A fonte do SAP e pequena. Por isso ampliamos bastante o recorte e
+        tentamos modos de segmentacao diferentes. Nenhuma whitelist e usada,
+        para nao perder '/', ':', '_' e '.' dos links.
+        """
+        scale = 4
         enlarged = image.resize(
             (image.width * scale, image.height * scale),
             Image.Resampling.LANCZOS,
         )
         gray = ImageOps.grayscale(enlarged)
-        contrast = ImageEnhance.Contrast(gray).enhance(2.0)
-        sharp = contrast.filter(ImageFilter.SHARPEN)
+        contrast = ImageEnhance.Contrast(gray).enhance(2.25)
+        sharp = contrast.filter(ImageFilter.SHARPEN).filter(ImageFilter.SHARPEN)
 
-        variants = [gray, contrast, sharp]
+        variants = [enlarged, gray, contrast, sharp]
         texts: list[str] = []
         for variant in variants:
-            for psm in (6, 4):
+            for psm in (6, 4, 11):
                 try:
                     text = pytesseract.image_to_string(
                         variant,
@@ -430,103 +448,386 @@ class SAPPhotoBot:
                     texts.append(text)
         return texts
 
-    def _pick_common_month_and_date(self, texts: list[str]) -> tuple[str, str]:
-        """Descobre pasta AAAAMM e data AAAAMMDD pela maioria dos OCRs."""
-        months: list[str] = []
-        dates: list[str] = []
-        for text in texts:
-            # Mantem os espacos entre campos numericos. Remover esses espacos
-            # faria 20260717 + numero da obra virarem um numero unico.
-            months.extend(re.findall(r"(?<!\d)(20\d{4})(?!\d)", text))
-            dates.extend(re.findall(r"(?<!\d)(20\d{6})(?!\d)", text))
+    def _ocr_grid_row_texts(self, image: Image.Image) -> list[str]:
+        """OCR adicional linha a linha da grade.
 
-        month = Counter(months).most_common(1)[0][0] if months else ""
-        date = Counter(dates).most_common(1)[0][0] if dates else ""
-
-        if not month and date:
-            month = date[:6]
-        return month, date
-
-    def _parse_ocr_link_rows(self, texts: list[str], obra: str) -> list[str]:
-        """Reconstrui URLs exatas a partir das linhas OCR da grade SAP.
-
-        O Tesseract geralmente converte '_' para espaco. Em vez de confiar na
-        URL inteira reconhecida, usamos o formato padrao do repositorio de
-        fotos e reconstruimos cada link com os campos visiveis da linha.
+        A grade SAP tem linhas horizontais regulares. Ler cada faixa com PSM 7
+        e mais confiavel para URLs pequenas do que depender apenas do OCR do
+        quadro inteiro. O resultado complementa (nao substitui) os outros OCRs.
         """
-        month, photo_date = self._pick_common_month_and_date(texts)
-        if not month or not photo_date:
+        try:
+            import numpy as np
+        except Exception:
             return []
 
-        found: dict[tuple[int, str], str] = {}
+        gray = np.array(ImageOps.grayscale(image))
+        dark_counts = (gray < 185).sum(axis=1)
+        # Texto gera densidade moderada; linhas de borda muito longas sao
+        # descartadas para nao virar uma faixa gigante.
+        mask = (dark_counts > max(6, int(image.width * 0.008))) & (
+            dark_counts < int(image.width * 0.72)
+        )
+
+        runs: list[list[int]] = []
+        start = None
+        last = None
+        for y, flag in enumerate(mask.tolist()):
+            if flag:
+                if start is None:
+                    start = y
+                last = y
+            elif start is not None:
+                runs.append([start, last])
+                start = None
+                last = None
+        if start is not None:
+            runs.append([start, last])
+
+        # Une fragmentos da mesma linha separados por poucos pixels.
+        merged: list[list[int]] = []
+        for run in runs:
+            if not merged or run[0] - merged[-1][1] > 4:
+                merged.append(run)
+            else:
+                merged[-1][1] = run[1]
+
+        texts: list[str] = []
+        for top, bottom in merged:
+            if bottom - top + 1 < 2:
+                continue
+            y1 = max(0, top - 4)
+            y2 = min(image.height, bottom + 5)
+            row = image.crop((0, y1, image.width, y2))
+            if row.width < 200 or row.height < 4:
+                continue
+
+            scale = 5
+            row = row.resize(
+                (row.width * scale, row.height * scale),
+                Image.Resampling.LANCZOS,
+            )
+            row = ImageEnhance.Contrast(ImageOps.grayscale(row)).enhance(2.1)
+            row = row.filter(ImageFilter.SHARPEN)
+
+            best = ""
+            for psm in (7, 6, 13):
+                try:
+                    text = pytesseract.image_to_string(
+                        row,
+                        lang=self.lang,
+                        config=f"--psm {psm}",
+                    ).strip()
+                except Exception:
+                    text = pytesseract.image_to_string(
+                        row,
+                        lang="eng",
+                        config=f"--psm {psm}",
+                    ).strip()
+                if len(text) > len(best):
+                    best = text
+            if best:
+                texts.append(best)
+
+        return texts
+
+    def _valid_month_candidate(self, value: str) -> str:
+        digits = re.sub(r"\D", "", str(value or ""))
+        if len(digits) != 6:
+            return ""
+        try:
+            year = int(digits[:4])
+            month = int(digits[4:6])
+        except ValueError:
+            return ""
+        if 2020 <= year <= 2035 and 1 <= month <= 12:
+            return digits
+        return ""
+
+    def _detect_common_month(self, texts: list[str]) -> str:
+        """Descobre o AAAAMM do caminho /EQTL_MA/AAAAMM/.
+
+        O mes e comum a maior parte das linhas, enquanto o dia da foto pode
+        variar. Por isso apenas o AAAAMM e calculado por consenso global.
+        """
+        candidates: list[str] = []
+        for text in texts:
+            normalized = str(text or "").upper()
+            # Corrige apenas confusoes numericas muito comuns antes do regex.
+            numericish = (
+                normalized.replace("O", "0")
+                .replace("I", "1")
+                .replace("L", "1")
+            )
+            for raw in re.findall(r"(?<!\d)(\d{6})(?!\d)", numericish):
+                valid = self._valid_month_candidate(raw)
+                if valid:
+                    candidates.append(valid)
+
+        if candidates:
+            return Counter(candidates).most_common(1)[0][0]
+
+        # Ultimo fallback: o fluxo atual e de fotos recentes. Se o OCR leu
+        # somente MM em varias linhas, usamos o ano corrente quando plausivel.
+        month_only: list[str] = []
+        current_year = datetime.now().year
+        for text in texts:
+            normalized = str(text or "").upper()
+            for mm in re.findall(r"(?:EQTL|EQT1|EOTL)[^\n]{0,20}?/(\d{2})/", normalized):
+                try:
+                    m = int(mm)
+                except ValueError:
+                    continue
+                if 1 <= m <= 12:
+                    month_only.append(f"{current_year:04d}{m:02d}")
+        return Counter(month_only).most_common(1)[0][0] if month_only else ""
+
+    def _extract_row_photo_date(self, line: str, month: str) -> str:
+        """Extrai AAAAMMDD da propria linha.
+
+        Diferentes links da mesma grade podem ter dias distintos. A versao
+        anterior escolhia uma unica data global e isso reconstruia URLs erradas.
+        Agora o dia e obtido individualmente por linha e combinado com o mes
+        confiavel do caminho.
+        """
+        if not month:
+            return ""
+
+        normalized = (
+            str(line or "").upper()
+            .replace("O", "0")
+            .replace("I", "1")
+            .replace("L", "1")
+        )
+
+        # Preferencia 1: data completa valida cujo prefixo coincide com AAAAMM.
+        for raw in re.findall(r"(?<!\d)(\d{8})(?!\d)", normalized):
+            if raw.startswith(month):
+                try:
+                    day = int(raw[-2:])
+                except ValueError:
+                    continue
+                if 1 <= day <= 31:
+                    return raw
+
+        # Preferencia 2: o inicio da data pode ter sido deformado pelo OCR,
+        # mas os dois ultimos digitos (dia) normalmente permanecem corretos.
+        # Usa candidatos proximos de PHOTO/FOTO primeiro.
+        zones = []
+        upper = normalized
+        pos = max(upper.find("PHOTO"), upper.find("PH0T0"), upper.find("FOTO"))
+        if pos >= 0:
+            zones.append(upper[pos:pos + 90])
+        zones.append(upper)
+
+        for zone in zones:
+            for raw in re.findall(r"(?<!\d)(\d{7,10})(?!\d)", zone):
+                if len(raw) < 2:
+                    continue
+                try:
+                    day = int(raw[-2:])
+                except ValueError:
+                    continue
+                if 1 <= day <= 31:
+                    return f"{month}{day:02d}"
+
+        return ""
+
+    def _best_photo_label_from_tail(self, tail: str) -> str:
+        compact = re.sub(r"[^A-Z0-9]", "", str(tail or "").upper())
+        compact = compact.replace("JPG", "")
+        if not compact:
+            return ""
+
+        # Match direto primeiro.
+        for candidate in self._KNOWN_PHOTO_LABELS:
+            if candidate in compact:
+                return "FACHADADOIMOVEL" if candidate == "FACHADAIMOVEL" else candidate
+
+        # Depois fuzzy contra os nomes padronizados.
+        best = ""
+        best_score = 0.0
+        for candidate in self._KNOWN_PHOTO_LABELS:
+            # Compara tambem janelas do tamanho aproximado do candidato,
+            # porque o tail pode conter lixo OCR antes/depois do nome.
+            scores = [SequenceMatcher(None, compact, candidate).ratio()]
+            clen = len(candidate)
+            if len(compact) > clen:
+                for start in range(0, max(1, len(compact) - clen + 1)):
+                    piece = compact[start:start + clen]
+                    scores.append(SequenceMatcher(None, piece, candidate).ratio())
+            score = max(scores)
+            if score > best_score:
+                best = candidate
+                best_score = score
+
+        if best_score >= 0.70:
+            return "FACHADADOIMOVEL" if best == "FACHADAIMOVEL" else best
+        return ""
+
+    def _parse_ocr_link_rows(self, texts: list[str], obra: str) -> list[str]:
+        """Reconstrui as URLs a partir do OCR, linha por linha.
+
+        Para os tipos padronizados do SAP, o numero EQ_FOTO e conhecido e
+        corrige leituras como 21 em vez de 11. Para tipos desconhecidos, tenta
+        usar o numero lido na propria linha.
+        """
+        month = self._detect_common_month(texts)
+        if not month:
+            return []
+
+        found: dict[tuple[str, int, str], str] = {}
 
         for text in texts:
-            for raw_line in text.splitlines():
+            for raw_line in str(text or "").splitlines():
                 line = str(raw_line or "").strip()
                 if not line:
                     continue
 
-                upper = line.upper()
-                # Ignora textos que claramente nao sao linhas de link.
-                if (
-                    "EQUATORIAL" not in upper
-                    and "EQ FOTO" not in upper
-                    and "EQ_FOTO" not in upper
-                    and " FOTO " not in f" {upper} "
-                ):
+                work = (
+                    line.upper()
+                    .replace("F0T0", "FOTO")
+                    .replace("F0TO", "FOTO")
+                    .replace("FOT0", "FOTO")
+                    .replace("PH0T0", "PHOTO")
+                )
+
+                # Primeiro identifica o tipo pela propria linha inteira. Isso
+                # funciona mesmo quando o OCR le FOTO como FOIO/FQ FOTO etc.
+                label = self._best_photo_label_from_tail(work)
+
+                # Numero lido: tenta FOTO N; se falhar, usa o ultimo inteiro
+                # curto que aparece imediatamente antes da parte alfabetica.
+                photo_number = None
+                matches = list(re.finditer(r"FOTO\s*[_\-: ]*\s*(\d{1,3})\b", work))
+                if matches:
+                    try:
+                        photo_number = int(matches[-1].group(1))
+                    except ValueError:
+                        photo_number = None
+
+                if label in self._PHOTO_NUMBER_BY_LABEL:
+                    photo_number = self._PHOTO_NUMBER_BY_LABEL[label]
+
+                if photo_number is None:
+                    # Fallback generico para tipos nao mapeados.
+                    generic = list(
+                        re.finditer(
+                            r"\b(\d{1,3})\s+([A-Z][A-Z0-9_\- ]{4,})(?:\.\s*J(?:P|F)?G|\bJPG\b|$)",
+                            work,
+                        )
+                    )
+                    if generic:
+                        try:
+                            photo_number = int(generic[-1].group(1))
+                        except ValueError:
+                            photo_number = None
+                        if not label:
+                            label = self._best_photo_label_from_tail(generic[-1].group(2))
+
+                if photo_number is None or not label:
                     continue
 
-                # Normaliza algumas leituras frequentes de FOTO.
-                work = upper.replace("F0T0", "FOTO").replace("F0TO", "FOTO")
-                work = work.replace("FOT0", "FOTO")
-
-                # Procura o numero apos FOTO. O prefixo EQ pode ou nao ter sido
-                # reconhecido pelo OCR, entao o regex e propositalmente amplo.
-                matches = list(re.finditer(r"FOTO\s*[_\- ]*\s*(\d{1,3})\s+", work))
-                if not matches:
-                    continue
-                m = matches[-1]
-                photo_number = int(m.group(1))
-
-                tail = work[m.end():]
-                # Termina no .JPG quando OCR o reconheceu; senao usa a cauda.
-                tail = re.split(r"\.\s*JPG|\bJPG\b", tail, maxsplit=1)[0]
-                label = self._normalize_ocr_photo_label(tail)
-                if not label:
+                photo_date = self._extract_row_photo_date(work, month)
+                if not photo_date:
                     continue
 
                 url = (
                     f"{self._PHOTO_BASE_URL}/{month}/"
                     f"OFS_PHOTO_{photo_date}_{obra}_EQ_FOTO_{photo_number}_{label}.jpg"
                 )
-                found[(photo_number, label)] = url
+                found[(photo_date, photo_number, label)] = url
 
-        # Ordena pela ordem visual mais comum (numero da foto) apenas para
-        # manter o TXT previsivel. Todas as URLs unicas sao preservadas.
-        return [found[key] for key in sorted(found, key=lambda x: (x[0], x[1]))]
+        return [
+            found[key]
+            for key in sorted(found, key=lambda x: (x[0], x[1], x[2]))
+        ]
+
+    def _detect_links_grid_region(self, full: Image.Image) -> tuple[int, int, int, int]:
+        """Detecta dinamicamente a regiao da grade usando o titulo 'Links'.
+
+        Isso evita depender de um Y fixo. Quando o RDP esta lado a lado com o
+        Streamlit, o layout local muda e a antiga regiao iniciando em 30% da
+        altura capturava principalmente a parte vazia da grade.
+        """
+        try:
+            scale = 2
+            probe = full.resize(
+                (full.width * scale, full.height * scale),
+                Image.Resampling.LANCZOS,
+            )
+            gray = ImageOps.grayscale(probe)
+            data = pytesseract.image_to_data(
+                gray,
+                lang=self.lang,
+                config="--psm 11",
+                output_type=pytesseract.Output.DICT,
+            )
+            best = None
+            for i, raw in enumerate(data.get("text", [])):
+                token = re.sub(r"[^A-Z]", "", str(raw or "").upper())
+                if token not in ("LINKS", "LINK"):
+                    continue
+                try:
+                    conf = float(data.get("conf", [0])[i])
+                except Exception:
+                    conf = 0.0
+                left = int(data["left"][i] / scale)
+                top = int(data["top"][i] / scale)
+                width = int(data["width"][i] / scale)
+                height = int(data["height"][i] / scale)
+                candidate = (conf, left, top, width, height)
+                if best is None or candidate[0] > best[0]:
+                    best = candidate
+
+            if best is not None:
+                _, left, top, width, height = best
+                x = max(0, left - 12)
+                y = max(0, top + height + 6)
+                # A grade ocupa a porcao esquerda do SAP e vai bem abaixo do
+                # titulo Links. Limites amplos, mas sem incluir o Streamlit.
+                w = min(full.width - x, int(full.width * 0.72))
+                h = min(full.height - y, int(full.height * 0.52))
+                if w > 200 and h > 120:
+                    return (x, y, w, h)
+        except Exception:
+            pass
+
+        # Fallback propositalmente amplo. Funciona tanto em RDP maximizado
+        # quanto lado a lado. E muito mais alto que o antigo y=0.30.
+        x = int(full.width * 0.005)
+        y = int(full.height * 0.15)
+        w = int(full.width * 0.72)
+        h = int(full.height * 0.52)
+        w = min(w, full.width - x)
+        h = min(h, full.height - y)
+        return (x, y, max(1, w), max(1, h))
 
     def _capture_links_grid_temp(
         self,
         obra: str,
         page: int,
         temp_dir: Path,
-        region_norm: tuple[float, float, float, float],
-    ) -> tuple[Image.Image, tuple[int, int, int, int]]:
-        """Tira um print TEMPORARIO somente da grade Links."""
+        region_abs_local: tuple[int, int, int, int] | None = None,
+    ) -> tuple[Image.Image, tuple[int, int, int, int], tuple[int, int, int, int]]:
+        """Tira um print temporario da grade Links.
+
+        Retorna (crop, regiao_absoluta_monitor, regiao_local_no_print_RDP).
+        """
         full, remote_abs = screenshot_window_contains(
             self.remote_title,
             content_only=False,
         )
-        rw, rh = full.size
-        rx, ry, rwidth, rheight = region_norm
-        x = max(0, int(round(rx * rw)))
-        y = max(0, int(round(ry * rh)))
-        w = max(1, int(round(rwidth * rw)))
-        h = max(1, int(round(rheight * rh)))
-        x2 = min(rw, x + w)
-        y2 = min(rh, y + h)
-        crop = full.crop((x, y, x2, y2))
 
+        if region_abs_local is None:
+            region_abs_local = self._detect_links_grid_region(full)
+
+        x, y, w, h = region_abs_local
+        x = max(0, min(x, full.width - 1))
+        y = max(0, min(y, full.height - 1))
+        w = max(1, min(w, full.width - x))
+        h = max(1, min(h, full.height - y))
+
+        crop = full.crop((x, y, x + w, y + h))
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_file = temp_dir / f"pagina_{page:02d}.png"
         crop.save(temp_file)
@@ -537,58 +838,60 @@ class SAPPhotoBot:
             crop.width,
             crop.height,
         )
-        return crop, abs_region
+        return crop, abs_region, (x, y, crop.width, crop.height)
 
     def _collect_all_urls_from_remote(self, obra: str, obra_dir: Path) -> list[str]:
-        """Extrai TODOS os links usando prints temporarios da grade + OCR.
-
-        Fluxo:
-            1. ativa o RDP e posiciona a grade no topo;
-            2. tira print temporario da grade Links;
-            3. OCR + reconstrucao das URLs;
-            4. rola a grade e repete ate nao aparecerem links novos;
-            5. apaga os prints temporarios depois do sucesso.
-
-        Nao usa Ctrl+C, Ctrl+Y nem clipboard do RDP.
-        """
+        """Extrai todos os links da grade por prints temporarios + OCR."""
         self._activate_remote()
         time.sleep(0.50)
 
-        # Regiao relativa a janela RDP. Abrange o quadro Links completo sem
-        # pegar as abas superiores. Foi ajustada para a tela SAP 1920x1080,
-        # mas continua proporcional caso o RDP tenha outro tamanho.
-        region_norm = (0.015, 0.300, 0.625, 0.310)
         temp_dir = obra_dir / "_temp_links_ocr"
+        temp_dir.mkdir(parents=True, exist_ok=True)
 
-        # Leva a lista para o topo antes da primeira captura.
-        left, top, width, height = get_window_region_contains(
+        # Detecta a grade no estado atual e usa a mesma regiao nas paginas
+        # seguintes para que a rolagem seja consistente.
+        first_full, _ = screenshot_window_contains(
             self.remote_title,
             content_only=False,
         )
-        grid_x = left + int(width * (region_norm[0] + region_norm[2] * 0.50))
-        grid_y = top + int(height * (region_norm[1] + region_norm[3] * 0.50))
+        local_region = self._detect_links_grid_region(first_full)
+        lx, ly, lw, lh = local_region
+
+        left, top, _, _ = get_window_region_contains(
+            self.remote_title,
+            content_only=False,
+        )
+        grid_x = left + lx + lw // 2
+        grid_y = top + ly + lh // 2
+
+        # Vai ao topo da grade antes da primeira captura.
         pyautogui.moveTo(grid_x, grid_y, duration=0.15)
-        for _ in range(8):
+        for _ in range(10):
             pyautogui.scroll(10)
-            time.sleep(0.06)
+            time.sleep(0.05)
         time.sleep(0.45)
 
         urls: list[str] = []
         seen: set[str] = set()
         max_pages = int(self.cfg.get("automation", {}).get("max_link_pages", 15))
         pages_without_new = 0
+        all_ocr_debug: list[str] = []
 
         try:
             for page in range(1, max_pages + 1):
-                image, abs_region = self._capture_links_grid_temp(
+                image, abs_region, _ = self._capture_links_grid_temp(
                     obra,
                     page,
                     temp_dir,
-                    region_norm,
+                    local_region,
                 )
 
                 texts = self._ocr_grid_text_variants(image)
+                texts.extend(self._ocr_grid_row_texts(image))
                 page_urls = self._parse_ocr_link_rows(texts, obra)
+                all_ocr_debug.append(
+                    f"\n===== PAGINA {page:02d} =====\n" + "\n--- OCR VARIANT ---\n".join(texts)
+                )
 
                 before = len(urls)
                 for url in page_urls:
@@ -611,24 +914,30 @@ class SAPPhotoBot:
                     f"{len(page_urls)} link(s) reconhecido(s) nesta pagina."
                 )
 
-                # Duas paginas consecutivas sem novidade indicam fim da lista.
                 if pages_without_new >= 2:
                     break
 
-                # Rola somente dentro da propria grade Links.
                 ax, ay, aw, ah = abs_region
                 pyautogui.moveTo(ax + aw // 2, ay + ah // 2, duration=0.10)
                 pyautogui.scroll(-7)
                 time.sleep(0.65)
 
             if not urls:
+                # Em erro, preserva tambem o texto OCR bruto para diagnostico.
+                try:
+                    (temp_dir / "ocr_debug.txt").write_text(
+                        "\n".join(all_ocr_debug),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
                 raise RuntimeError(
                     "Nenhum link foi reconhecido nos prints temporarios da grade Links. "
-                    "Os prints foram mantidos na pasta _temp_links_ocr para diagnostico."
+                    "Os prints e o OCR bruto foram mantidos na pasta _temp_links_ocr para diagnostico."
                 )
 
-            # O usuario pediu prints apenas temporarios. Mantemos ate concluir a
-            # leitura e, em caso de sucesso, removemos a pasta inteira.
+            # O usuario pediu prints apenas temporarios. So apaga depois que
+            # pelo menos um link foi realmente reconstruido.
             try:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:
@@ -637,7 +946,6 @@ class SAPPhotoBot:
             return urls
 
         except Exception:
-            # Em erro, NAO apaga os prints: eles ajudam a diagnosticar o OCR.
             raise
 
     def _create_links_notepad(self, obra: str, obra_dir: Path, urls: list[str]) -> Path:
