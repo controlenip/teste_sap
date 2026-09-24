@@ -873,6 +873,253 @@ class SAPPhotoBot:
             out.append(url)
         return out
 
+    def _return_to_initial_and_load_next(
+        self,
+        current_obra: str,
+        next_obra: Optional[str] = None,
+    ) -> None:
+        """
+        Depois de copiar/gravar os links da obra atual:
+
+        1. volta imediatamente para a tela inicial do SAP com ESC;
+        2. seleciona o campo Nota;
+        3. apaga o numero da obra atual;
+        4. se houver proxima obra, digita o proximo numero e pressiona ENTER;
+        5. se for a ultima obra, deixa o campo Nota vazio.
+
+        Esta rotina roda ANTES do processamento das fotos no navegador local.
+        Assim, em uma lista com varias obras, toda a coleta de links no SAP e
+        feita primeiro, obra por obra, e somente depois o robo passa a baixar
+        as fotos no navegador do computador.
+        """
+        self._activate_remote()
+
+        self.emit(
+            f"Obra {current_obra}: links copiados. Voltando para a tela inicial do SAP..."
+        )
+
+        # Pela tela enviada pelo usuario, um ESC sai da nota aberta e volta
+        # diretamente para "Exibir nota de servico: 1a tela".
+        pyautogui.press("esc")
+        time.sleep(1.35)
+
+        # Se o SAP ainda estiver na tela detalhada por atraso de resposta,
+        # faz uma segunda tentativa segura.
+        try:
+            if not self._is_initial_note_screen():
+                pyautogui.press("esc")
+                time.sleep(1.15)
+        except Exception:
+            # O OCR da tela inicial pode falhar por escala; nao impede o uso
+            # do ponto fixo do campo Nota.
+            pass
+
+        # Campo Nota da tela inicial. Usa a calibracao que ja vinha funcionando
+        # no fluxo normal de entrada das obras.
+        try:
+            self._click_point("note_field_initial")
+        except Exception:
+            # Fallback proporcional observado na tela inicial 1920x1080.
+            x, y = norm_point_in_window_to_abs(
+                self.remote_title,
+                (0.122, 0.193),
+                content_only=False,
+            )
+            pyautogui.click(x, y)
+
+        time.sleep(0.20)
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.08)
+        pyautogui.press("backspace")
+        time.sleep(0.12)
+
+        next_digits = "".join(ch for ch in str(next_obra or "") if ch.isdigit())
+
+        if not next_digits:
+            self.emit(
+                f"Obra {current_obra}: ultima obra da lista. Campo Nota foi limpo.",
+                level="success",
+            )
+            return
+
+        pyautogui.write(
+            next_digits,
+            interval=float(
+                self.cfg.get("automation", {}).get("typing_interval", 0.035)
+            ),
+        )
+        time.sleep(0.15)
+        pyautogui.press("enter")
+
+        self.emit(
+            f"Proxima obra {next_digits}: numero informado e ENTER enviado.",
+            level="success",
+        )
+
+        # Deixa a proxima nota completamente carregada para a proxima iteracao
+        # da fase SAP. Nao abre Dados de Campo 2 aqui; isso ocorre no inicio da
+        # iteracao seguinte.
+        wait_after_enter = float(
+            self.cfg.get("timing", {}).get("after_note_enter", 3.0)
+        )
+        time.sleep(max(1.5, wait_after_enter))
+
+    def _process_local_links_for_obra(
+        self,
+        obra: str,
+        obra_dir: Path,
+        txt_path: Path,
+        all_urls: list[str],
+        progress_start: float = 0.40,
+        progress_end: float = 0.96,
+    ) -> dict:
+        """Processa localmente os links ja coletados do SAP.
+
+        Nesta etapa o SAP/RDP nao e usado para abrir fotos. O TXT da obra e a
+        unica fonte de URLs.
+        """
+        records: list[dict] = []
+        urls_from_txt = self._read_links_from_notepad_file(txt_path)
+        total = len(urls_from_txt)
+        facade_found = False
+        facade_lat = None
+        facade_lon = None
+
+        for index, url in enumerate(urls_from_txt, start=1):
+            progress = progress_start + (
+                (progress_end - progress_start) * (index - 1) / max(1, total)
+            )
+            self.emit(
+                f"Obra {obra}: processando link {index}/{total} do bloco de notas...",
+                progress=progress,
+            )
+
+            try:
+                photo_result = self._process_url_from_notepad(
+                    obra, index, total, url, obra_dir
+                )
+
+                is_facade = bool(photo_result.get("is_facade"))
+                path = photo_result.get("path")
+                lat = photo_result.get("latitude") if is_facade else None
+                lon = photo_result.get("longitude") if is_facade else None
+
+                if is_facade:
+                    facade_found = True
+                    facade_lat = lat
+                    facade_lon = lon
+
+                status_link = "SALVO" if path else "ERRO AO SALVAR"
+                if is_facade:
+                    coord_status = (
+                        "OK"
+                        if lat is not None and lon is not None
+                        else "COORDENADA NAO RECONHECIDA"
+                    )
+                else:
+                    coord_status = "NAO APLICAVEL - SOMENTE FACHADA"
+
+                records.append({
+                    "OBRA": obra,
+                    "ORDEM": index,
+                    "TIPO_FOTO": (
+                        "FACHADADOIMOVEL"
+                        if is_facade
+                        else photo_result.get("filename", f"FOTO_{index:03d}")
+                    ),
+                    "LINK_IDENTIFICADO_OCR": url,
+                    "LATITUDE": lat if lat is not None else "",
+                    "LONGITUDE": lon if lon is not None else "",
+                    "ARQUIVO_FOTO": str(path) if path else "",
+                    "STATUS_LINK": status_link,
+                    "STATUS_COORDENADA": coord_status,
+                    "OCR_RODAPE": photo_result.get("ocr_text", "") if is_facade else "",
+                    "ARQUIVO_LINKS": str(txt_path),
+                    "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                })
+
+                if path:
+                    self.emit(
+                        f"Obra {obra}: foto {index}/{total} salva em {Path(path).name}.",
+                        level="success",
+                    )
+                else:
+                    self.emit(
+                        f"Obra {obra}: link {index}/{total} abriu, mas a foto nao foi salva.",
+                        level="warning",
+                    )
+
+                if is_facade:
+                    if lat is not None and lon is not None:
+                        self.emit(
+                            f"Obra {obra}: coordenada da FACHADA DO IMOVEL = "
+                            f"{lat:.6f}, {lon:.6f}.",
+                            level="success",
+                        )
+                    else:
+                        self.emit(
+                            f"Obra {obra}: FACHADA DO IMOVEL salva, mas a coordenada "
+                            "nao foi reconhecida.",
+                            level="warning",
+                        )
+
+            except Exception as exc:
+                records.append({
+                    "OBRA": obra,
+                    "ORDEM": index,
+                    "TIPO_FOTO": "",
+                    "LINK_IDENTIFICADO_OCR": url,
+                    "LATITUDE": "",
+                    "LONGITUDE": "",
+                    "ARQUIVO_FOTO": "",
+                    "STATUS_LINK": "ERRO LOCAL",
+                    "STATUS_COORDENADA": "NAO PROCESSADA",
+                    "OCR_RODAPE": "",
+                    "ARQUIVO_LINKS": str(txt_path),
+                    "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                })
+                self.emit(
+                    f"Obra {obra}: erro no link {index}/{total}: {exc}",
+                    level="error",
+                )
+                if not self.cfg.get("automation", {}).get("continue_when_photo_missing", True):
+                    raise
+
+        if not facade_found:
+            self.emit(
+                f"Obra {obra}: nenhuma URL de FACHADA DO IMOVEL foi encontrada no bloco de notas.",
+                level="warning",
+            )
+
+        excel_path = save_work_excel(records, obra_dir / f"{obra}_coordenadas.xlsx")
+        if self.cfg.get("output", {}).get("create_consolidated_excel", True):
+            update_consolidated(records, self.output_root / "resumo_geral.xlsx")
+
+        zip_path = None
+        if self.cfg.get("output", {}).get("create_zip", True):
+            zip_base = obra_dir.parent / f"{obra}"
+            zip_result = shutil.make_archive(str(zip_base), "zip", root_dir=obra_dir)
+            zip_path = Path(zip_result)
+
+        self.emit(
+            f"Obra {obra}: processamento local concluido. "
+            f"{len(all_urls)} link(s), {len(records)} registro(s).",
+            level="success",
+            progress=progress_end,
+        )
+
+        return {
+            "obra": obra,
+            "folder": obra_dir,
+            "excel": excel_path,
+            "links_txt": txt_path,
+            "zip": zip_path,
+            "records": records,
+            "fachada_latitude": facade_lat,
+            "fachada_longitude": facade_lon,
+            "ok": True,
+        }
+
     def _safe_photo_filename(self, url: str, index: int) -> str:
         parsed = urlparse.urlparse(url)
         raw_name = urlparse.unquote(Path(parsed.path).name).strip()
@@ -1058,13 +1305,18 @@ class SAPPhotoBot:
             pass
 
     def process_work(self, obra: str, work_index: int = 0, total_works: int = 1) -> dict:
+        """Processa uma unica obra.
+
+        Para uma obra isolada, coleta os links no SAP, volta imediatamente para
+        a tela inicial deixando o campo Nota vazio e, em seguida, processa as
+        fotos localmente.
+        """
         obra = "".join(ch for ch in str(obra).strip() if ch.isdigit())
         if not obra:
             raise ValueError("Numero de obra vazio ou invalido.")
 
         obra_dir = self.output_root / obra
         obra_dir.mkdir(parents=True, exist_ok=True)
-        records: list[dict] = []
 
         try:
             self.emit(f"Obra {obra}: iniciando.", progress=0.02)
@@ -1075,156 +1327,26 @@ class SAPPhotoBot:
             self._open_images_tab()
             self.emit(f"Obra {obra}: Imagens de Campo aberta.", progress=0.18)
 
-            # 1) Copia TODOS os links da grade SAP remota.
             all_urls = self._collect_all_urls_from_remote(obra, obra_dir)
             self.emit(
                 f"Obra {obra}: coleta concluida com {len(all_urls)} link(s).",
                 level="success",
-                progress=0.32,
+                progress=0.28,
             )
 
-            # 2) Cria um bloco de notas com todos os links, um por linha.
             txt_path = self._create_links_notepad(obra, obra_dir, all_urls)
 
-            # 3) O TXT passa a ser a fonte: abre um link por vez no navegador local.
-            urls_from_txt = self._read_links_from_notepad_file(txt_path)
-            total = len(urls_from_txt)
-            facade_found = False
-            facade_lat = None
-            facade_lon = None
+            # NOVO: volta ao SAP inicial IMEDIATAMENTE apos copiar os links.
+            self._return_to_initial_and_load_next(obra, None)
 
-            for index, url in enumerate(urls_from_txt, start=1):
-                progress = 0.32 + (0.58 * (index - 1) / max(1, total))
-                self.emit(
-                    f"Obra {obra}: processando link {index}/{total} do bloco de notas...",
-                    progress=progress,
-                )
-
-                try:
-                    photo_result = self._process_url_from_notepad(
-                        obra, index, total, url, obra_dir
-                    )
-
-                    is_facade = bool(photo_result.get("is_facade"))
-                    path = photo_result.get("path")
-                    lat = photo_result.get("latitude") if is_facade else None
-                    lon = photo_result.get("longitude") if is_facade else None
-
-                    if is_facade:
-                        facade_found = True
-                        facade_lat = lat
-                        facade_lon = lon
-
-                    status_link = "SALVO" if path else "ERRO AO SALVAR"
-                    if is_facade:
-                        coord_status = (
-                            "OK"
-                            if lat is not None and lon is not None
-                            else "COORDENADA NAO RECONHECIDA"
-                        )
-                    else:
-                        coord_status = "NAO APLICAVEL - SOMENTE FACHADA"
-
-                    records.append({
-                        "OBRA": obra,
-                        "ORDEM": index,
-                        "TIPO_FOTO": (
-                            "FACHADADOIMOVEL"
-                            if is_facade
-                            else photo_result.get("filename", f"FOTO_{index:03d}")
-                        ),
-                        "LINK_IDENTIFICADO_OCR": url,
-                        "LATITUDE": lat if lat is not None else "",
-                        "LONGITUDE": lon if lon is not None else "",
-                        "ARQUIVO_FOTO": str(path) if path else "",
-                        "STATUS_LINK": status_link,
-                        "STATUS_COORDENADA": coord_status,
-                        "OCR_RODAPE": photo_result.get("ocr_text", "") if is_facade else "",
-                        "ARQUIVO_LINKS": str(txt_path),
-                        "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                    })
-
-                    if path:
-                        self.emit(
-                            f"Obra {obra}: foto {index}/{total} salva em {Path(path).name}.",
-                            level="success",
-                        )
-                    else:
-                        self.emit(
-                            f"Obra {obra}: link {index}/{total} abriu, mas a foto nao foi salva.",
-                            level="warning",
-                        )
-
-                    if is_facade:
-                        if lat is not None and lon is not None:
-                            self.emit(
-                                f"Obra {obra}: coordenada da FACHADA DO IMOVEL = "
-                                f"{lat:.6f}, {lon:.6f}.",
-                                level="success",
-                            )
-                        else:
-                            self.emit(
-                                f"Obra {obra}: FACHADA DO IMOVEL salva, mas a coordenada "
-                                "nao foi reconhecida.",
-                                level="warning",
-                            )
-
-                except Exception as exc:
-                    records.append({
-                        "OBRA": obra,
-                        "ORDEM": index,
-                        "TIPO_FOTO": "",
-                        "LINK_IDENTIFICADO_OCR": url,
-                        "LATITUDE": "",
-                        "LONGITUDE": "",
-                        "ARQUIVO_FOTO": "",
-                        "STATUS_LINK": "ERRO LOCAL",
-                        "STATUS_COORDENADA": "NAO PROCESSADA",
-                        "OCR_RODAPE": "",
-                        "ARQUIVO_LINKS": str(txt_path),
-                        "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                    })
-                    self.emit(
-                        f"Obra {obra}: erro no link {index}/{total}: {exc}",
-                        level="error",
-                    )
-                    if not self.cfg.get("automation", {}).get("continue_when_photo_missing", True):
-                        raise
-
-            if not facade_found:
-                self.emit(
-                    f"Obra {obra}: nenhuma URL de FACHADA DO IMOVEL foi encontrada no bloco de notas.",
-                    level="warning",
-                )
-
-            excel_path = save_work_excel(records, obra_dir / f"{obra}_coordenadas.xlsx")
-            if self.cfg.get("output", {}).get("create_consolidated_excel", True):
-                update_consolidated(records, self.output_root / "resumo_geral.xlsx")
-
-            zip_path = None
-            if self.cfg.get("output", {}).get("create_zip", True):
-                zip_base = obra_dir.parent / f"{obra}"
-                zip_result = shutil.make_archive(str(zip_base), "zip", root_dir=obra_dir)
-                zip_path = Path(zip_result)
-
-            self.emit(
-                f"Obra {obra}: processamento concluido. "
-                f"{len(all_urls)} link(s), {len(records)} registro(s).",
-                level="success",
-                progress=1.0,
+            return self._process_local_links_for_obra(
+                obra,
+                obra_dir,
+                txt_path,
+                all_urls,
+                progress_start=0.34,
+                progress_end=1.0,
             )
-
-            return {
-                "obra": obra,
-                "folder": obra_dir,
-                "excel": excel_path,
-                "links_txt": txt_path,
-                "zip": zip_path,
-                "records": records,
-                "fachada_latitude": facade_lat,
-                "fachada_longitude": facade_lon,
-                "ok": True,
-            }
 
         except pyautogui.FailSafeException as exc:
             self._error_screenshot(obra, "FAILSAFE")
@@ -1239,18 +1361,160 @@ class SAPPhotoBot:
             raise
 
     def process_many(self, obras: Iterable[str]) -> list[dict]:
-        obras = [str(x).strip() for x in obras if str(x).strip()]
-        results = []
-        total = len(obras)
-        for idx, obra in enumerate(obras):
+        """Processa varias obras em DUAS FASES.
+
+        FASE 1 - SAP / Area Remota:
+            obra 1 -> copia links -> ESC -> limpa Nota -> digita obra 2 -> ENTER
+            obra 2 -> copia links -> ESC -> limpa Nota -> digita obra 3 -> ENTER
+            ...
+            ultima obra -> copia links -> ESC -> limpa Nota
+
+        FASE 2 - COMPUTADOR LOCAL:
+            le cada *_links.txt, abre as URLs no navegador padrao, salva as
+            fotos e extrai a coordenada apenas da FACHADA DO IMOVEL.
+
+        Assim o robo nao fica alternando entre RDP e navegador local a cada
+        obra e atende exatamente ao fluxo solicitado.
+        """
+        normalized: list[str] = []
+        for item in obras:
+            digits = "".join(ch for ch in str(item).strip() if ch.isdigit())
+            if digits:
+                normalized.append(digits)
+
+        if not normalized:
+            return []
+
+        total_works = len(normalized)
+        remote_jobs: list[dict] = []
+        results_by_obra: dict[str, dict] = {}
+
+        # ------------------------------------------------------------
+        # FASE 1: COLETA DE LINKS DE TODAS AS OBRAS NO SAP
+        # ------------------------------------------------------------
+        self._prepare_remote_for_automation()
+
+        for idx, obra in enumerate(normalized):
+            obra_dir = self.output_root / obra
+            obra_dir.mkdir(parents=True, exist_ok=True)
+            next_obra = normalized[idx + 1] if idx + 1 < total_works else None
+
             try:
-                results.append(self.process_work(obra, idx, total))
+                self.emit(
+                    f"Obra {obra}: iniciando coleta SAP ({idx + 1}/{total_works}).",
+                    progress=0.02 + (0.28 * idx / max(1, total_works)),
+                )
+
+                # A primeira obra ainda precisa ser digitada. As seguintes ja
+                # foram digitadas + ENTER pela iteracao anterior.
+                if idx == 0:
+                    self._enter_note(obra)
+                else:
+                    self.emit(
+                        f"Obra {obra}: nota ja carregada pela troca automatica da obra anterior."
+                    )
+
+                self.emit(f"Obra {obra}: nota aberta.")
+                self._open_images_tab()
+                self.emit(f"Obra {obra}: Imagens de Campo aberta.")
+
+                all_urls = self._collect_all_urls_from_remote(obra, obra_dir)
+                txt_path = self._create_links_notepad(obra, obra_dir, all_urls)
+
+                remote_jobs.append({
+                    "obra": obra,
+                    "obra_dir": obra_dir,
+                    "urls": all_urls,
+                    "txt_path": txt_path,
+                })
+
+                self.emit(
+                    f"Obra {obra}: {len(all_urls)} link(s) copiado(s).",
+                    level="success",
+                )
+
+                # NOVO FLUXO PEDIDO PELO USUARIO:
+                # imediatamente apos copiar os links, ESC -> tela inicial ->
+                # apaga obra atual -> digita a proxima -> ENTER.
+                self._return_to_initial_and_load_next(
+                    current_obra=obra,
+                    next_obra=next_obra,
+                )
+
+            except pyautogui.FailSafeException as exc:
+                self._error_screenshot(obra, "FAILSAFE")
+                results_by_obra[obra] = {
+                    "obra": obra,
+                    "ok": False,
+                    "error": "Automacao interrompida pelo usuario (FAILSAFE).",
+                    "records": [],
+                }
+                self.emit(
+                    f"Obra {obra}: execucao interrompida pelo FAILSAFE.",
+                    level="error",
+                )
+                break
             except Exception as exc:
-                self.emit(f"Obra {obra}: ERRO - {exc}", level="error")
-                results.append({
+                self._error_screenshot(obra, "COLETA_SAP")
+                self.emit(f"Obra {obra}: ERRO na coleta SAP - {exc}", level="error")
+                results_by_obra[obra] = {
                     "obra": obra,
                     "ok": False,
                     "error": str(exc),
                     "records": [],
-                })
-        return results
+                }
+
+                # Tenta voltar para a tela inicial e carregar a proxima obra
+                # mesmo quando a coleta atual falhar, para nao travar a lista.
+                try:
+                    self._return_to_initial_and_load_next(obra, next_obra)
+                except Exception as nav_exc:
+                    self.emit(
+                        f"Obra {obra}: nao foi possivel preparar a proxima obra: {nav_exc}",
+                        level="error",
+                    )
+                    break
+
+        # ------------------------------------------------------------
+        # FASE 2: PROCESSAMENTO LOCAL DOS TXTs JA COLETADOS
+        # ------------------------------------------------------------
+        if remote_jobs:
+            self.emit(
+                "Coleta no SAP concluida. Iniciando processamento das fotos no navegador local...",
+                level="success",
+                progress=0.34,
+            )
+
+        for local_idx, job in enumerate(remote_jobs):
+            obra = job["obra"]
+            try:
+                start = 0.34 + (0.64 * local_idx / max(1, len(remote_jobs)))
+                end = 0.34 + (0.64 * (local_idx + 1) / max(1, len(remote_jobs)))
+                result = self._process_local_links_for_obra(
+                    obra=obra,
+                    obra_dir=job["obra_dir"],
+                    txt_path=job["txt_path"],
+                    all_urls=job["urls"],
+                    progress_start=start,
+                    progress_end=min(0.99, end),
+                )
+                results_by_obra[obra] = result
+            except Exception as exc:
+                self.emit(f"Obra {obra}: ERRO no processamento local - {exc}", level="error")
+                results_by_obra[obra] = {
+                    "obra": obra,
+                    "ok": False,
+                    "error": str(exc),
+                    "records": [],
+                }
+
+        # Mantem exatamente a mesma ordem digitada/colada na ferramenta.
+        return [
+            results_by_obra.get(obra, {
+                "obra": obra,
+                "ok": False,
+                "error": "Obra nao processada.",
+                "records": [],
+            })
+            for obra in normalized
+        ]
