@@ -353,7 +353,7 @@ class SAPPhotoBot:
         save_debug_image(image, self.debug_root / f"{obra}_{target_key}_{label}_{stamp}.png")
 
     # ------------------------------------------------------------------
-    # COLETA DE LINKS POR PRINT + OCR - V15
+    # COLETA DE LINKS POR PRINT + OCR - V16 MULTIMONITOR
     # ------------------------------------------------------------------
     # IMPORTANTE:
     # Nesta versao NENHUM hyperlink da grade SAP e clicado.
@@ -546,6 +546,17 @@ class SAPPhotoBot:
             content_only=False,
         )
 
+        # Diagnostico importante: a captura precisa conter a janela RDP inteira.
+        # Na versao anterior, quando o RDP estava no segundo monitor, o limite
+        # baseado no monitor principal reduzia a imagem para apenas 1 pixel de
+        # largura. Isso tornava qualquer OCR impossivel.
+        if full.width < 500 or full.height < 400:
+            raise RuntimeError(
+                'Captura da Area Remota invalida para OCR: '
+                f'{full.width}x{full.height} px; regiao absoluta={remote_abs}. '
+                'Atualize modules/window_control.py para a versao multimonitor.'
+            )
+
         # Regiao propositalmente ampla: pega titulo Links, todas as linhas
         # visiveis e parte vazia inferior. O detector de linhas abaixo recorta
         # cada hyperlink individualmente.
@@ -582,7 +593,7 @@ class SAPPhotoBot:
         gray = np.array(ImageOps.grayscale(image))
         # Conta pixels suficientemente escuros por linha horizontal.
         dark_counts = (gray < 220).sum(axis=1)
-        threshold = max(80, int(image.width * 0.42))
+        threshold = max(60, int(image.width * 0.18))
 
         # Non-maximum suppression: escolhe picos fortes separados entre si.
         # Distancia minima acompanha a escala da captura.
@@ -781,7 +792,7 @@ class SAPPhotoBot:
 
             new_count = len(urls) - before
             self.emit(
-                f"Obra {obra}: pagina {page} analisada; "
+                f"Obra {obra}: pagina {page} analisada ({image.width}x{image.height}px); "
                 f"{new_count} novo(s) link(s), {len(urls)} no total."
             )
 
