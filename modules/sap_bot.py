@@ -242,39 +242,142 @@ class SAPPhotoBot:
         ))
 
     def _open_images_tab(self):
-        """Abre Dados de Campo 2 -> Imagens de Campo com temporizacao rapida.
+        """Abre Dados de Campo 2 -> Imagens de Campo de forma robusta.
 
-        Os cliques fixos ja foram calibrados e estao funcionando; portanto o
-        OCR de confirmacao foi removido desta etapa. A captura da grade Links
-        logo em seguida e a validacao real.
+        A versao anterior usava coordenadas fixas normalizadas. Essas
+        coordenadas podem variar com escala do RDP/SAP. Agora a prioridade e
+        localizar o texto real dentro da Area Remota por OCR e clicar no centro
+        dele. Os pontos do config.json ficam apenas como fallback.
         """
         self._activate_remote()
 
-        self.emit("Clicando em Dados de Campo 2...")
-        x, y = norm_point_in_window_to_abs(
-            self.remote_title, (0.317, 0.197), content_only=False
+        # --------------------------------------------------------------
+        # 1) DADOS DE CAMPO 2
+        # --------------------------------------------------------------
+        self.emit("Localizando Dados de Campo 2...")
+
+        main_tabs_region = [0.00, 0.04, 0.82, 0.30]
+        clicked, detected = click_text(
+            [
+                "Dados de Campo 2",
+                "Dados de Campo2",
+                "Dadosde Campo2",
+                "DadosdeCampo2",
+                "Dados Campo 2",
+            ],
+            main_tabs_region,
+            lang=self.lang,
+            threshold=40,
+            window_title=self.remote_title,
         )
-        pyautogui.moveTo(x, y, duration=0.05)
-        pyautogui.click()
+
+        if clicked:
+            self.emit(f"Dados de Campo 2 localizado pelo OCR: {detected}")
+        else:
+            self.emit(
+                "OCR nao localizou Dados de Campo 2; usando ponto de fallback.",
+                level="warning",
+            )
+            if "dados_campo_2_fallback" in self.cfg.get("points", {}):
+                self._click_point("dados_campo_2_fallback")
+            else:
+                # Fallback compativel com o layout classico do SAP.
+                x, y = norm_point_in_window_to_abs(
+                    self.remote_title, (0.315, 0.185), content_only=False
+                )
+                pyautogui.click(x, y)
+
         time.sleep(float(
-            self.cfg.get("automation", {}).get("fast_after_dados_campo2", 0.65)
+            self.cfg.get("automation", {}).get("fast_after_dados_campo2", 0.75)
         ))
 
-        self.emit("Clicando em Imagens de Campo...")
-        x, y = norm_point_in_window_to_abs(
-            self.remote_title, (0.292, 0.243), content_only=False
+        # Confirma que as subabas de Dados de Campo 2 apareceram. Se o SAP
+        # estiver mais lento, faz uma segunda tentativa antes de prosseguir.
+        subtab_ready = wait_for_text(
+            ["Imagens de Campo", "Fornecimento", "Finance. de Padrao", "Cobranca"],
+            [0.00, 0.10, 0.86, 0.28],
+            lang=self.lang,
+            threshold=36,
+            timeout=1.8,
+            poll_interval=0.25,
+            window_title=self.remote_title,
         )
-        pyautogui.moveTo(x, y, duration=0.05)
-        pyautogui.click()
 
-        # Segunda tentativa curta, mantendo a robustez da versao anterior.
-        time.sleep(0.18)
-        pyautogui.click(x, y)
+        if not subtab_ready:
+            self.emit(
+                "Dados de Campo 2 ainda nao abriu; repetindo o clique...",
+                level="warning",
+            )
+            clicked_again, _ = click_text(
+                ["Dados de Campo 2", "Dados de Campo2", "DadosdeCampo2"],
+                main_tabs_region,
+                lang=self.lang,
+                threshold=36,
+                window_title=self.remote_title,
+            )
+            if not clicked_again:
+                if "dados_campo_2_fallback" in self.cfg.get("points", {}):
+                    self._click_point("dados_campo_2_fallback")
+            time.sleep(0.65)
+
+        # --------------------------------------------------------------
+        # 2) IMAGENS DE CAMPO
+        # --------------------------------------------------------------
+        self.emit("Localizando Imagens de Campo...")
+
+        sub_tabs_region = [0.00, 0.10, 0.86, 0.30]
+        clicked, detected = click_text(
+            [
+                "Imagens de Campo",
+                "Imagens Campo",
+                "ImagensdeCampo",
+                "Imagem de Campo",
+            ],
+            sub_tabs_region,
+            lang=self.lang,
+            threshold=38,
+            window_title=self.remote_title,
+        )
+
+        if clicked:
+            self.emit(f"Imagens de Campo localizada pelo OCR: {detected}")
+        else:
+            self.emit(
+                "OCR nao localizou Imagens de Campo; usando ponto de fallback.",
+                level="warning",
+            )
+            if "imagens_campo_fallback" in self.cfg.get("points", {}):
+                self._click_point("imagens_campo_fallback")
+            else:
+                x, y = norm_point_in_window_to_abs(
+                    self.remote_title, (0.290, 0.235), content_only=False
+                )
+                pyautogui.click(x, y)
+
         time.sleep(float(
-            self.cfg.get("automation", {}).get("fast_after_imagens_campo", 0.75)
+            self.cfg.get("automation", {}).get("fast_after_imagens_campo", 0.85)
         ))
 
-        self.emit("Imagens de Campo acionada; iniciando captura dos links.")
+        # O OCR da palavra Links e apenas uma verificacao rapida. Nao aborta
+        # aqui porque a etapa seguinte (captura da grade) ja faz a validacao
+        # definitiva.
+        links_ready = wait_for_text(
+            ["Links", "FOTO", ".jpg"],
+            [0.00, 0.16, 0.78, 0.60],
+            lang=self.lang,
+            threshold=32,
+            timeout=1.4,
+            poll_interval=0.25,
+            window_title=self.remote_title,
+        )
+
+        if links_ready:
+            self.emit("Imagens de Campo aberta; grade Links detectada.")
+        else:
+            self.emit(
+                "Imagens de Campo acionada; seguindo para captura da grade Links.",
+                level="warning",
+            )
 
     def _save_ocr_debug(self, obra: str, target_key: str, image: Image.Image, label: str):
         if not self.cfg.get("ocr", {}).get("save_debug_images", True):
