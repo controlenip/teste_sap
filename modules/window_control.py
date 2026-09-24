@@ -6,6 +6,7 @@ from typing import Iterable, Optional, Tuple
 
 import pyautogui
 import pygetwindow as gw
+from PIL import ImageGrab
 
 
 SW_RESTORE = 9
@@ -240,59 +241,119 @@ def activate_window_contains(text: str, wait: float = 0.5, timeout: float = 10.0
 
 
 
-def maximize_window_contains(text: str, wait: float = 1.2, timeout: float = 5.0):
-    """Maximiza a janela local do RDP antes da automacao.
+def maximize_window_contains(text: str, wait: float = 1.2, timeout: float = 6.0):
+    """Maximiza de forma agressiva a janela local do RDP.
 
-    Isto e importante porque o SAP muda de escala quando o RDP fica em meia tela.
-    Os pontos calibrados de Dados de Campo 2 e Imagens de Campo foram obtidos com
-    a sessao remota maximizada. Ao maximizar primeiro, os cliques ficam previsiveis
-    e o OCR dos links ganha resolucao suficiente para ler os nomes dos JPGs.
+    Algumas estações Windows ignoram ``ShowWindow(SW_MAXIMIZE)`` quando a
+    janela está encaixada em meia tela. Por isso esta função usa, em sequência:
+
+    1. API nativa do Windows;
+    2. ``pygetwindow.maximize()``;
+    3. duplo clique físico na barra de título;
+    4. atalho ``Win + Up``;
+    5. validação real pelo tamanho da janela.
+
+    O OCR dos links só é confiável quando o RDP ocupa praticamente a tela toda.
     """
     window = find_window_contains(text)
     if window is None:
         raise RuntimeError(f"Janela contendo '{text}' nao foi encontrada.")
 
-    # Primeiro garante foco/restauracao.
     try:
         activate_window_contains(text, wait=0.15, timeout=timeout)
     except Exception:
         pass
 
-    hwnd = _window_hwnd(window)
-    maximized = False
+    screen_w, screen_h = pyautogui.size()
 
+    def is_big_enough(win) -> bool:
+        try:
+            return (
+                int(win.width) >= int(screen_w * 0.90)
+                and int(win.height) >= int(screen_h * 0.82)
+            )
+        except Exception:
+            return False
+
+    def refresh():
+        return find_window_contains(text) or window
+
+    # 1) API nativa.
+    hwnd = _window_hwnd(window)
     if hwnd:
         try:
-            ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-            maximized = True
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            time.sleep(0.15)
+            user32.ShowWindow(hwnd, SW_MAXIMIZE)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.45)
         except Exception:
             pass
 
-    if not maximized:
-        try:
-            window.maximize()
-            maximized = True
-        except Exception:
-            pass
+    window = refresh()
+    if is_big_enough(window):
+        time.sleep(max(0.0, float(wait)))
+        return window
 
-    # Aguarda a geometria estabilizar. Nao exige tamanho exato porque a barra de
-    # tarefas e a moldura do RDP podem reduzir alguns pixels.
+    # 2) Método do pygetwindow.
+    try:
+        window.maximize()
+        time.sleep(0.45)
+    except Exception:
+        pass
+
+    window = refresh()
+    if is_big_enough(window):
+        time.sleep(max(0.0, float(wait)))
+        return window
+
+    # 3) Duplo clique físico na barra de título do RDP.
+    try:
+        left = int(window.left)
+        top = int(window.top)
+        width = int(window.width)
+        x = left + max(120, min(width // 2, max(120, width - 160)))
+        y = top + 12
+        pyautogui.doubleClick(x, y, interval=0.15)
+        time.sleep(0.60)
+    except Exception:
+        pass
+
+    window = refresh()
+    if is_big_enough(window):
+        time.sleep(max(0.0, float(wait)))
+        return window
+
+    # 4) Win + Seta para cima, muito confiável para janela encaixada.
+    try:
+        activate_window_contains(text, wait=0.10, timeout=2.0)
+        pyautogui.hotkey('win', 'up')
+        time.sleep(0.70)
+    except Exception:
+        pass
+
+    # 5) Aguarda a geometria estabilizar e valida.
     end = time.time() + max(1.0, float(timeout))
-    screen_w, screen_h = pyautogui.size()
     while time.time() < end:
-        current = find_window_contains(text)
-        if current is not None:
-            try:
-                if int(current.width) >= int(screen_w * 0.80) and int(current.height) >= int(screen_h * 0.75):
-                    window = current
-                    break
-            except Exception:
-                pass
+        current = refresh()
+        if is_big_enough(current):
+            time.sleep(max(0.0, float(wait)))
+            return current
         time.sleep(0.15)
 
-    time.sleep(max(0.0, float(wait)))
-    return find_window_contains(text) or window
+    current = refresh()
+    try:
+        size_txt = f"{int(current.width)}x{int(current.height)}"
+    except Exception:
+        size_txt = "desconhecido"
+
+    raise RuntimeError(
+        "A Área Remota foi encontrada, mas não conseguiu ser maximizada. "
+        f"Tamanho atual: {size_txt}; tela local: {screen_w}x{screen_h}. "
+        "Maximize a janela RDP manualmente uma vez e tente novamente."
+    )
 
 def active_window_title() -> str:
     try:
@@ -334,21 +395,90 @@ def get_window_region_contains(text: str, content_only: bool = False) -> Tuple[i
     return left, top, width, height
 
 
-def _clamp_region_to_screen(region: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
-    left, top, width, height = region
+def get_virtual_screen_region() -> Tuple[int, int, int, int]:
+    """Retorna o retangulo do desktop virtual inteiro do Windows.
+
+    Diferente de ``pyautogui.size()``, esta funcao inclui todos os monitores.
+    Isso e essencial quando a janela da Area Remota esta no segundo monitor,
+    pois nesse caso ``left`` pode ser 1920, 2560 etc.
+    """
+    try:
+        user32 = ctypes.windll.user32
+        SM_XVIRTUALSCREEN = 76
+        SM_YVIRTUALSCREEN = 77
+        SM_CXVIRTUALSCREEN = 78
+        SM_CYVIRTUALSCREEN = 79
+
+        left = int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+        top = int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+        width = int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+        height = int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+
+        if width > 0 and height > 0:
+            return left, top, width, height
+    except Exception:
+        pass
+
+    # Fallback para computador com um unico monitor.
     sw, sh = pyautogui.size()
-    x1 = max(0, min(int(left), sw - 1))
-    y1 = max(0, min(int(top), sh - 1))
-    x2 = max(x1 + 1, min(int(left + width), sw))
-    y2 = max(y1 + 1, min(int(top + height), sh))
+    return 0, 0, int(sw), int(sh)
+
+
+def _clamp_region_to_screen(region: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    """Limita uma regiao ao DESKTOP VIRTUAL, nao apenas ao monitor principal."""
+    left, top, width, height = [int(v) for v in region]
+    vx, vy, vw, vh = get_virtual_screen_region()
+
+    vr = vx + vw
+    vb = vy + vh
+
+    x1 = max(vx, min(left, vr - 1))
+    y1 = max(vy, min(top, vb - 1))
+    x2 = max(x1 + 1, min(left + max(1, width), vr))
+    y2 = max(y1 + 1, min(top + max(1, height), vb))
+
     return x1, y1, x2 - x1, y2 - y1
 
 
 def screenshot_window_contains(text: str, content_only: bool = False):
-    """Captura somente a janela RDP identificada pelo título."""
+    """Captura somente a janela RDP, inclusive quando ela esta em outro monitor.
+
+    A versao anterior usava ``pyautogui.size()`` para limitar a captura.
+    Essa funcao informa apenas o tamanho do monitor principal. Quando o RDP
+    estava no segundo monitor (por exemplo ``left=1920``), a largura era
+    reduzida para 1 pixel.
+
+    Aqui usamos o desktop virtual do Windows e ``PIL.ImageGrab`` com
+    ``all_screens=True``.
+    """
     region = get_window_region_contains(text, content_only=content_only)
     region = _clamp_region_to_screen(region)
-    return pyautogui.screenshot(region=region), region
+    left, top, width, height = region
+
+    if width < 50 or height < 50:
+        raise RuntimeError(
+            'A regiao calculada para a Area Remota ficou invalida: '
+            f'{region}. Verifique a posicao da janela RDP e os monitores.'
+        )
+
+    bbox = (left, top, left + width, top + height)
+
+    try:
+        image = ImageGrab.grab(bbox=bbox, all_screens=True)
+    except TypeError:
+        # Compatibilidade com versoes antigas do Pillow.
+        image = ImageGrab.grab(bbox=bbox)
+    except Exception:
+        # Ultimo fallback. Em monitor principal, pyautogui normalmente funciona.
+        image = pyautogui.screenshot(region=region)
+
+    if image.width < 50 or image.height < 50:
+        raise RuntimeError(
+            'A captura da Area Remota ficou invalida: '
+            f'{image.width}x{image.height} px; regiao={region}.'
+        )
+
+    return image, region
 
 
 def norm_point_in_window_to_abs(
