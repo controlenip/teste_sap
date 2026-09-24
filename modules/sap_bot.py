@@ -25,7 +25,7 @@ import pytesseract
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .config import APP_DIR, resolve_output_root
-from .excel_utils import save_work_excel, update_consolidated
+from .word_report import build_word_report, default_report_path
 from .vision import (
     click_text,
     extract_coordinates_from_photo,
@@ -1014,10 +1014,9 @@ class SAPPhotoBot:
                 level="warning",
             )
 
-        excel_path = save_work_excel(records, obra_dir / f"{obra}_coordenadas.xlsx")
-        if self.cfg.get("output", {}).get("create_consolidated_excel", True):
-            update_consolidated(records, self.output_root / "resumo_geral.xlsx")
-
+        # O Excel de coordenadas foi removido. O relatorio final agora e Word,
+        # com uma obra por pagina, gerado depois que todas as obras forem
+        # processadas localmente.
         zip_path = None
         if self.cfg.get("output", {}).get("create_zip", True):
             zip_base = obra_dir.parent / f"{obra}"
@@ -1034,7 +1033,8 @@ class SAPPhotoBot:
         return {
             "obra": obra,
             "folder": obra_dir,
-            "excel": excel_path,
+            "excel": None,
+            "word": None,
             "links_txt": txt_path,
             "zip": zip_path,
             "records": records,
@@ -1299,14 +1299,27 @@ class SAPPhotoBot:
             # NOVO: volta ao SAP inicial IMEDIATAMENTE apos copiar os links.
             self._return_to_initial_and_load_next(obra, None)
 
-            return self._process_local_links_for_obra(
+            result = self._process_local_links_for_obra(
                 obra,
                 obra_dir,
                 txt_path,
                 all_urls,
                 progress_start=0.34,
-                progress_end=1.0,
+                progress_end=0.96,
             )
+
+            # Uma obra isolada tambem gera Word. A coordenada usada no link
+            # Google Maps vem exclusivamente do OCR da FACHADA DO IMOVEL.
+            report_path = default_report_path(self.output_root)
+            word_path, base_used = build_word_report([result], report_path)
+            result["word"] = word_path
+            result["base_word"] = base_used
+            self.emit(
+                f"Obra {obra}: relatorio Word gerado em {word_path.name}.",
+                level="success",
+                progress=1.0,
+            )
+            return result
 
         except pyautogui.FailSafeException as exc:
             self._error_screenshot(obra, "FAILSAFE")
@@ -1468,8 +1481,9 @@ class SAPPhotoBot:
                     "records": [],
                 }
 
-        # Mantem exatamente a mesma ordem digitada/colada na ferramenta.
-        return [
+        # Monta um unico Word consolidado, com uma obra por pagina.
+        # O Word substitui os antigos arquivos Excel de coordenadas.
+        ordered_results = [
             results_by_obra.get(obra, {
                 "obra": obra,
                 "ok": False,
@@ -1478,3 +1492,40 @@ class SAPPhotoBot:
             })
             for obra in normalized
         ]
+
+        successful = [r for r in ordered_results if r.get("ok")]
+        if successful:
+            try:
+                report_path = default_report_path(self.output_root)
+                word_path, base_used = build_word_report(successful, report_path)
+                for r in successful:
+                    r["word"] = word_path
+                    r["base_word"] = base_used
+                self.emit(
+                    f"Relatorio Word concluido: {word_path.name} "
+                    f"({len(successful)} obra(s), uma por pagina).",
+                    level="success",
+                    progress=1.0,
+                )
+                if base_used:
+                    self.emit(
+                        f"Base utilizada no Word: {Path(base_used).name}.",
+                        level="info",
+                    )
+                else:
+                    self.emit(
+                        "Base de levantamento nao encontrada. O Word foi gerado "
+                        "com os campos adicionais em branco.",
+                        level="warning",
+                    )
+            except Exception as exc:
+                self.emit(
+                    f"Falha ao gerar relatorio Word: {exc}",
+                    level="error",
+                )
+                for r in successful:
+                    r["word"] = None
+                    r["word_error"] = str(exc)
+
+        # Mantem exatamente a mesma ordem digitada/colada na ferramenta.
+        return ordered_results
