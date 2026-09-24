@@ -1284,91 +1284,245 @@ def extract_largest_photo_from_screen(
     *,
     min_area_ratio: float = 0.02,
 ) -> tuple[Image.Image, tuple[int, int, int, int], bool]:
-    """Recorta a foto real de um navegador com grande fundo branco.
+    """Recorta SOMENTE a fotografia exibida no navegador.
 
-    Primeiro usa saturação/cor (mais robusto para fotos dentro de IE/Edge) e só
-    depois cai no método antigo de pixels não brancos.
+    Esta função é usada quando o download HTTP direto da imagem não é possível
+    e o robô precisa tirar um print do navegador local. O retorno deve conter
+    apenas a foto, sem barra do navegador, menus, fundo preto/branco ou outros
+    elementos da tela.
+
+    Estratégias, nesta ordem:
+      1. detectar o grande retângulo fotográfico pela variação/texture das colunas
+         e linhas (muito eficaz para imagem centralizada em fundo preto do Opera);
+      2. detectar o maior bloco colorido por saturação;
+      3. fallback para o maior bloco não branco.
+
+    Se nenhuma estratégia encontrar um retângulo confiável, ``cropped`` será
+    False. O chamador não deve salvar a tela inteira como se fosse uma foto.
     """
+
     sw, sh = screenshot.size
     x, y, rw, rh = norm_region_to_abs(region_norm, (sw, sh))
     area_img = screenshot.crop((x, y, x + rw, y + rh)).convert("RGB")
     area = np.array(area_img)
 
-    # Estrategia 1: maior bloco colorido. Em uma página com fundo branco, a foto
-    # de campo é disparado o maior retângulo com saturação relevante.
-    hsv = cv2.cvtColor(area, cv2.COLOR_RGB2HSV)
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    color_mask = ((sat > 28) & (val < 252)).astype(np.uint8) * 255
-    color_mask = cv2.morphologyEx(
-        color_mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
-        iterations=2,
-    )
-    color_mask = cv2.morphologyEx(
-        color_mask,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
-        iterations=1,
-    )
-    contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-    min_area = max(2500, int(rw * rh * min_area_ratio))
-    for cnt in contours:
-        bx, by, bw, bh = cv2.boundingRect(cnt)
-        if bw < 120 or bh < 160:
-            continue
-        if bw * bh < min_area:
-            continue
-        candidates.append((bw * bh, bx, by, bw, bh))
-
-    if candidates:
-        _, bx, by, bw, bh = max(candidates, key=lambda t: t[0])
-        pad = 2
-        bx2 = max(0, bx - pad)
-        by2 = max(0, by - pad)
-        ex = min(rw, bx + bw + pad)
-        ey = min(rh, by + bh + pad)
-        crop = area_img.crop((bx2, by2, ex, ey))
-        if crop.width >= 120 and crop.height >= 160:
-            return crop, (x + bx2, y + by2, ex - bx2, ey - by2), True
-
-    # Estrategia 2: compatibilidade com fotos pouco saturadas.
-    gray = cv2.cvtColor(area, cv2.COLOR_RGB2GRAY)
-    mask = (gray < 245).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        iterations=1,
-    )
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        iterations=1,
-    )
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-    for cnt in contours:
-        bx, by, bw, bh = cv2.boundingRect(cnt)
-        area_px = bw * bh
-        if area_px < min_area or bw < 120 or bh < 160:
-            continue
-        candidates.append((area_px, bx, by, bw, bh))
-
-    if not candidates:
+    if area.size == 0 or rw < 120 or rh < 160:
         return area_img, (x, y, rw, rh), False
 
-    _, bx, by, bw, bh = max(candidates, key=lambda t: t[0])
-    margin = 1
-    bx2 = max(0, bx + margin)
-    by2 = max(0, by + margin)
-    ex = min(rw, bx + bw - margin)
-    ey = min(rh, by + bh - margin)
-    crop = area_img.crop((bx2, by2, ex, ey))
-    return crop, (x + bx2, y + by2, ex - bx2, ey - by2), True
+    min_area = max(2500, int(rw * rh * min_area_ratio))
+
+    def _runs(mask: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+        runs: list[tuple[int, int]] = []
+        start_idx = None
+        for idx, value in enumerate(mask.tolist()):
+            if bool(value) and start_idx is None:
+                start_idx = idx
+            is_last = idx == len(mask) - 1
+            if start_idx is not None and ((not bool(value)) or is_last):
+                end_idx = idx if not bool(value) else idx + 1
+                if end_idx - start_idx >= min_len:
+                    runs.append((start_idx, end_idx))
+                start_idx = None
+        return runs
+
+    # ------------------------------------------------------------------
+    # Estratégia 1 - retângulo de textura
+    # ------------------------------------------------------------------
+    # Em navegadores com fundo preto (Opera, Edge etc.) a fotografia forma um
+    # grande bloco com muita variação tonal. Menus laterais e barras do navegador
+    # têm variação bem menor e/ou são muito estreitos. Esse método permite incluir
+    # até áreas escuras da própria foto, algo que máscara por saturação nem sempre
+    # consegue fazer.
+    try:
+        gray_float = area.astype(np.float32).mean(axis=2)
+
+        # Ignora somente uma margem mínima superior da região recebida. O
+        # ``sap_bot`` já costuma excluir a barra superior com region_norm.
+        body_y0 = max(0, int(rh * 0.01))
+        body = gray_float[body_y0:rh, :]
+
+        col_range = (
+            np.percentile(body, 90, axis=0)
+            - np.percentile(body, 10, axis=0)
+        )
+
+        col_candidates: list[tuple[int, float, int, int]] = []
+        min_col_run = max(60, int(rw * 0.05))
+        min_photo_width = max(120, int(rw * 0.12))
+
+        for threshold in (42, 36, 30, 25, 20, 15):
+            for cx1, cx2 in _runs(col_range > threshold, min_col_run):
+                width = cx2 - cx1
+                if width < min_photo_width:
+                    continue
+                # Evita aceitar a tela inteira como "foto".
+                if width > int(rw * 0.92):
+                    continue
+                texture = float(col_range[cx1:cx2].mean())
+                col_candidates.append((width, texture, cx1, cx2))
+            if col_candidates:
+                break
+
+        if col_candidates:
+            _, _, tx1, tx2 = max(
+                col_candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+
+            strip = gray_float[:, tx1:tx2]
+            row_range = (
+                np.percentile(strip, 90, axis=1)
+                - np.percentile(strip, 10, axis=1)
+            )
+
+            row_candidates: list[tuple[int, float, int, int]] = []
+            min_row_run = max(80, int(rh * 0.10))
+            min_photo_height = max(160, int(rh * 0.22))
+
+            for threshold in (18, 15, 12, 10, 8, 6):
+                for ty1, ty2 in _runs(row_range > threshold, min_row_run):
+                    height = ty2 - ty1
+                    if height < min_photo_height:
+                        continue
+                    if height > int(rh * 0.99):
+                        # Pode ser válido se a foto realmente ocupa quase toda a
+                        # área útil, por isso não rejeitamos automaticamente.
+                        pass
+                    texture = float(row_range[ty1:ty2].mean())
+                    row_candidates.append((height, texture, ty1, ty2))
+                if row_candidates:
+                    break
+
+            if row_candidates:
+                _, _, ty1, ty2 = max(
+                    row_candidates,
+                    key=lambda item: (item[0], item[1]),
+                )
+
+                pad = 2
+                tx1 = max(0, tx1 - pad)
+                ty1 = max(0, ty1 - pad)
+                tx2 = min(rw, tx2 + pad)
+                ty2 = min(rh, ty2 + pad)
+
+                tw = tx2 - tx1
+                th = ty2 - ty1
+                if (
+                    tw >= 120
+                    and th >= 160
+                    and tw * th >= min_area
+                    and tw < int(rw * 0.95)
+                ):
+                    crop = area_img.crop((tx1, ty1, tx2, ty2))
+                    return (
+                        crop,
+                        (x + tx1, y + ty1, tw, th),
+                        True,
+                    )
+    except Exception:
+        # As estratégias abaixo continuam disponíveis.
+        pass
+
+    # ------------------------------------------------------------------
+    # Estratégia 2 - maior bloco colorido
+    # ------------------------------------------------------------------
+    try:
+        hsv = cv2.cvtColor(area, cv2.COLOR_RGB2HSV)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        color_mask = ((sat > 28) & (val < 252)).astype(np.uint8) * 255
+        color_mask = cv2.morphologyEx(
+            color_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17)),
+            iterations=3,
+        )
+        color_mask = cv2.morphologyEx(
+            color_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+            iterations=1,
+        )
+
+        contours, _ = cv2.findContours(
+            color_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        candidates = []
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            area_px = bw * bh
+            if bw < 120 or bh < 160 or area_px < min_area:
+                continue
+            if bw > int(rw * 0.95) and bh > int(rh * 0.90):
+                continue
+            candidates.append((area_px, bx, by, bw, bh))
+
+        if candidates:
+            _, bx, by, bw, bh = max(candidates, key=lambda item: item[0])
+            pad = 3
+            bx1 = max(0, bx - pad)
+            by1 = max(0, by - pad)
+            bx2 = min(rw, bx + bw + pad)
+            by2 = min(rh, by + bh + pad)
+            crop = area_img.crop((bx1, by1, bx2, by2))
+            if crop.width >= 120 and crop.height >= 160:
+                return (
+                    crop,
+                    (x + bx1, y + by1, bx2 - bx1, by2 - by1),
+                    True,
+                )
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
+    # Estratégia 3 - maior bloco não branco (IE / fundo branco)
+    # ------------------------------------------------------------------
+    try:
+        gray = cv2.cvtColor(area, cv2.COLOR_RGB2GRAY)
+        mask = (gray < 242).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
+            iterations=2,
+        )
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        candidates = []
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            area_px = bw * bh
+            if area_px < min_area or bw < 120 or bh < 160:
+                continue
+            if bw > int(rw * 0.95) and bh > int(rh * 0.90):
+                continue
+            candidates.append((area_px, bx, by, bw, bh))
+
+        if candidates:
+            _, bx, by, bw, bh = max(candidates, key=lambda item: item[0])
+            margin = 2
+            bx1 = max(0, bx - margin)
+            by1 = max(0, by - margin)
+            bx2 = min(rw, bx + bw + margin)
+            by2 = min(rh, by + bh + margin)
+            crop = area_img.crop((bx1, by1, bx2, by2))
+            if crop.width >= 120 and crop.height >= 160:
+                return (
+                    crop,
+                    (x + bx1, y + by1, bx2 - bx1, by2 - by1),
+                    True,
+                )
+    except Exception:
+        pass
+
+    # Segurança: NÃO devolve a tela inteira como uma fotografia válida.
+    return area_img, (x, y, rw, rh), False
 
 def save_debug_image(image: Image.Image, path: Path | str) -> None:
     path = Path(path)
