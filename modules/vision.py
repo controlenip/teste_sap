@@ -914,121 +914,352 @@ def detect_link_row_centers(
     return centers_abs, image, region_abs
 
 def _normalize_ocr_coord_text(text: str) -> str:
+    """Normaliza caracteres que o OCR costuma confundir no carimbo GPS."""
     s = str(text or "")
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
     s = s.replace(";", ",")
+    # Correcoes conservadoras somente quando aparecem junto de numeros.
+    s = re.sub(r"(?<=\d)[Oo](?=\d)", "0", s)
+    s = re.sub(r"(?<=\d)[Il](?=\d)", "1", s)
     return s
 
 
-def _find_coordinate_pairs(text: str) -> list[tuple[float, float, str]]:
+def _number_candidates_from_ocr_token(
+    token: str,
+    *,
+    kind: str,
+) -> list[tuple[float, bool]]:
+    """Converte um token OCR em candidatos numericos.
+
+    Retorna pares ``(valor, reconstruido)``. A reconstrucao cobre o erro mais
+    comum do Tesseract no carimbo das fotos: perder o ponto decimal, por exemplo
+    ``4449856`` em vez de ``44.49856``.
+    """
+    raw = _normalize_ocr_coord_text(token).strip()
+    if not raw:
+        return []
+
+    sign = -1.0 if raw.startswith("-") else 1.0
+    body = raw.lstrip("+-").replace(",", ".")
+    body = re.sub(r"[^0-9.]", "", body)
+    body = re.sub(r"\.{2,}", ".", body)
+
+    out: list[tuple[float, bool]] = []
+
+    # Leitura direta quando o decimal sobreviveu ao OCR.
+    if body.count(".") == 1:
+        try:
+            value = sign * float(body)
+            out.append((value, False))
+        except ValueError:
+            pass
+
+    digits = re.sub(r"\D", "", body)
+    if not digits:
+        return out
+
+    # Se o decimal sumiu, reconstrói usando a geometria esperada de latitude/
+    # longitude. Para EQTL_MA, latitude normalmente possui 1 algarismo inteiro
+    # e longitude 2; mantemos uma segunda opcao para casos de fronteira.
+    split_positions = (1, 2) if kind == "lat" else (2, 3)
+    for split in split_positions:
+        if len(digits) <= split + 2:
+            continue
+        try:
+            value = sign * float(digits[:split] + "." + digits[split:])
+        except ValueError:
+            continue
+        out.append((value, True))
+
+    # Remove duplicatas preservando a leitura direta primeiro.
+    deduped: list[tuple[float, bool]] = []
+    seen: set[float] = set()
+    for value, rebuilt in out:
+        key = round(value, 8)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((value, rebuilt))
+    return deduped
+
+
+def _coordinate_score(lat: float, lon: float, *, rebuilt: bool = False) -> float:
+    """Pontua candidatos para priorizar coordenadas plausiveis da operacao MA."""
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return -10_000.0
+
+    score = 0.0
+
+    # Brasil.
+    if -35.5 <= lat <= 6.5 and -75.5 <= lon <= -30.0:
+        score += 40.0
+
+    # Maranhão - faixa deliberadamente ampla para não excluir bordas do estado.
+    if -11.5 <= lat <= 0.5 and -50.0 <= lon <= -40.0:
+        score += 60.0
+
+    if lat < 0:
+        score += 6.0
+    if lon < 0:
+        score += 8.0
+    if rebuilt:
+        score -= 4.0
+
+    return score
+
+
+def _find_coordinate_pairs(text: str) -> list[tuple[float, float, str, float]]:
+    """Extrai pares de coordenadas, inclusive quando o OCR perde o decimal."""
     s = _normalize_ocr_coord_text(text)
-    patterns = [
+    out: list[tuple[float, float, str, float]] = []
+
+    # 1) Formato normal, ex.: -4.40731, -44.49856
+    strict_patterns = [
         r"(-?\d{1,2}[\.,]\d{3,8})\s*[, ]\s*(-?\d{2,3}[\.,]\d{3,8})",
         r"(-?\d{1,2}[\.,]\d{3,8})\s+(-?\d{2,3}[\.,]\d{3,8})",
     ]
-    out: list[tuple[float, float, str]] = []
-    for pattern in patterns:
+    for pattern in strict_patterns:
         for m in re.finditer(pattern, s):
-            a = m.group(1).replace(",", ".")
-            b = m.group(2).replace(",", ".")
             try:
-                lat = float(a)
-                lon = float(b)
+                lat = float(m.group(1).replace(",", "."))
+                lon = float(m.group(2).replace(",", "."))
             except ValueError:
                 continue
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                out.append((lat, lon, m.group(0)))
-    # Remove duplicatas preservando ordem.
-    seen = set()
-    unique = []
+            score = _coordinate_score(lat, lon, rebuilt=False) + 15.0
+            if score > -1000:
+                out.append((lat, lon, m.group(0), score))
+
+    # 2) Formato permissivo. Aceita ponto decimal perdido em um dos lados, como
+    #    "40731,-4449856" ou "40731,-44.49856".
+    loose_pattern = re.compile(
+        r"(?<!\d)([-+]?\d[\d\.,]{3,9})\s*[, ]\s*([-+]?\d[\d\.,]{5,12})(?!\d)"
+    )
+    for m in loose_pattern.finditer(s):
+        lat_tokens = _number_candidates_from_ocr_token(m.group(1), kind="lat")
+        lon_tokens = _number_candidates_from_ocr_token(m.group(2), kind="lon")
+        for lat, lat_rebuilt in lat_tokens:
+            for lon, lon_rebuilt in lon_tokens:
+                # Longitude das fotos da operacao e oeste; se o OCR perdeu apenas
+                # o sinal, corrigimos depois de validar a magnitude brasileira.
+                if lon > 0 and 30 <= lon <= 76:
+                    lon = -lon
+                score = _coordinate_score(
+                    lat,
+                    lon,
+                    rebuilt=lat_rebuilt or lon_rebuilt,
+                )
+                if score > 0:
+                    out.append((lat, lon, m.group(0), score))
+
+    # Remove duplicatas e mantém a maior pontuação.
+    best_by_key: dict[tuple[float, float], tuple[float, float, str, float]] = {}
     for item in out:
-        key = (round(item[0], 8), round(item[1], 8))
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-    return unique
+        lat, lon, matched, score = item
+        key = (round(lat, 7), round(lon, 7))
+        old = best_by_key.get(key)
+        if old is None or score > old[3]:
+            best_by_key[key] = item
+
+    return sorted(best_by_key.values(), key=lambda x: x[3], reverse=True)
 
 
-def _pick_best_coordinate(candidates: Sequence[tuple[float, float, str]]) -> Optional[tuple[float, float, str]]:
-    if not candidates:
-        return None
-    # Prioriza coordenadas plausíveis para Brasil e, em seguida, qualquer par válido.
-    br = [c for c in candidates if -35.5 <= c[0] <= 6.5 and -75.5 <= c[1] <= -30.0]
-    pool = br or list(candidates)
-    return pool[0] if pool else None
+def _photo_only_for_coordinate_ocr(photo: Image.Image) -> tuple[Image.Image, bool]:
+    """Se ``photo`` for na verdade um print do navegador, recorta só a foto.
 
+    O problema observado no fluxo real era o OCR receber a janela inteira do
+    navegador. O carimbo ficava fora do rodapé calculado. Detectamos esse caso
+    pela grande proporção de fundo quase branco e localizamos o maior bloco
+    colorido da tela.
+    """
+    rgb = photo.convert("RGB")
+    arr = np.array(rgb)
+    if arr.size == 0:
+        return rgb, False
 
-def preprocess_footer_variants(photo: Image.Image) -> list[tuple[str, np.ndarray]]:
-    arr = np.array(photo.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    white_ratio = float(np.mean(gray >= 247))
+
+    # Uma foto normal raramente tem mais de 38% dos pixels praticamente brancos.
+    # Só tentamos o recorte automático quando há forte evidência de screenshot.
+    if white_ratio < 0.38:
+        return rgb, False
+
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    mask = ((saturation > 28) & (value < 252)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
+        iterations=2,
+    )
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+        iterations=1,
+    )
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: list[tuple[int, int, int, int, int]] = []
     h, w = arr.shape[:2]
-    # O carimbo aparece no rodapé; pega faixa ampla e privilegia metade direita.
-    footer = arr[max(0, int(h * 0.78)) : h, max(0, int(w * 0.32)) : w]
-    gray = cv2.cvtColor(footer, cv2.COLOR_RGB2GRAY)
-    up = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(up)
-    variants: list[tuple[str, np.ndarray]] = [("gray", up), ("clahe", clahe)]
-    for th in (160, 180, 200, 220):
-        _, bw = cv2.threshold(clahe, th, 255, cv2.THRESH_BINARY)
-        variants.append((f"bw_{th}", bw))
-        variants.append((f"inv_{th}", 255 - bw))
-    return variants
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        area = cw * ch
+        if cw < max(120, int(w * 0.10)) or ch < max(160, int(h * 0.18)):
+            continue
+        if area < int(w * h * 0.025):
+            continue
+        candidates.append((area, x, y, cw, ch))
+
+    if not candidates:
+        return rgb, False
+
+    _, x, y, cw, ch = max(candidates, key=lambda t: t[0])
+
+    # Pequena margem para não cortar o primeiro/último pixel da fotografia.
+    pad = 2
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(w, x + cw + pad)
+    y2 = min(h, y + ch + pad)
+
+    cropped = rgb.crop((x1, y1, x2, y2))
+    if cropped.width < 120 or cropped.height < 160:
+        return rgb, False
+    return cropped, True
 
 
-def extract_coordinates_from_photo(photo: Image.Image, lang: str = "eng", prefer_negative_lat: bool = True) -> dict:
-    attempts = []
-    all_candidates: list[tuple[float, float, str, str]] = []
-    for name, variant in preprocess_footer_variants(photo):
-        try:
-            text = pytesseract.image_to_string(
-                variant,
-                lang=lang,
-                config="--psm 6 -c tessedit_char_whitelist=0123456789-.,:()/UTC ",
+def _coordinate_regions(photo: Image.Image) -> list[tuple[str, Image.Image]]:
+    """Gera regiões progressivas onde o carimbo GPS costuma aparecer."""
+    w, h = photo.size
+    boxes = [
+        ("rodape_direita", (int(w * 0.45), int(h * 0.72), w, h)),
+        ("rodape_direita_amplo", (int(w * 0.28), int(h * 0.64), w, h)),
+        ("rodape_inteiro", (0, int(h * 0.68), w, h)),
+        ("metade_inferior", (0, int(h * 0.52), w, h)),
+    ]
+    return [(name, photo.crop(box)) for name, box in boxes]
+
+
+def _ocr_coordinate_region(region: Image.Image, lang: str) -> list[dict]:
+    """Executa poucas variantes fortes de OCR em uma região do carimbo."""
+    arr = np.array(region.convert("RGB"))
+    if arr.size == 0:
+        return []
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    attempts: list[dict] = []
+    # 6x preserva melhor o pequeno texto sobreposto das fotos de campo.
+    up = cv2.resize(gray, None, fx=6.0, fy=6.0, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(up)
+
+    # Realça texto claro e sua sombra sem explodir o ruído da fotografia.
+    _, bw = cv2.threshold(clahe, 175, 255, cv2.THRESH_BINARY)
+    variants = [
+        ("gray6x", up),
+        ("clahe6x", clahe),
+        ("bw175", bw),
+    ]
+
+    for variant_name, variant in variants:
+        for psm in (6, 11):
+            config = (
+                f"--psm {psm} "
+                "-c tessedit_char_whitelist=0123456789-.,:()/UTC "
             )
-        except pytesseract.TesseractError:
-            text = pytesseract.image_to_string(
-                variant,
-                lang="eng",
-                config="--psm 6 -c tessedit_char_whitelist=0123456789-.,:()/UTC ",
+            try:
+                text = pytesseract.image_to_string(variant, lang=lang, config=config)
+            except pytesseract.TesseractError:
+                text = pytesseract.image_to_string(variant, lang="eng", config=config)
+            candidates = _find_coordinate_pairs(text)
+            attempts.append(
+                {
+                    "variant": f"{variant_name}_psm{psm}",
+                    "text": text,
+                    "candidates": candidates,
+                }
             )
-        candidates = _find_coordinate_pairs(text)
-        attempts.append({"variant": name, "text": text, "candidates": candidates})
-        for lat, lon, matched in candidates:
-            all_candidates.append((lat, lon, matched, name))
+    return attempts
+
+
+def extract_coordinates_from_photo(
+    photo: Image.Image,
+    lang: str = "eng",
+    prefer_negative_lat: bool = True,
+) -> dict:
+    """Extrai latitude/longitude da FACHADA DO IMOVEL.
+
+    A função agora suporta tanto a imagem JPG pura quanto um screenshot do
+    navegador contendo a foto em uma pequena área. O OCR começa no canto
+    inferior direito e amplia progressivamente a busca.
+    """
+    prepared, auto_cropped = _photo_only_for_coordinate_ocr(photo)
+
+    all_attempts: list[dict] = []
+    all_candidates: list[tuple[float, float, str, float, str]] = []
+
+    regions = _coordinate_regions(prepared)
+    region_bonus = {
+        "rodape_direita": 18.0,
+        "rodape_direita_amplo": 12.0,
+        "rodape_inteiro": 7.0,
+        "metade_inferior": 2.0,
+    }
+
+    for region_name, region in regions:
+        attempts = _ocr_coordinate_region(region, lang)
+        for attempt in attempts:
+            attempt["region"] = region_name
+            all_attempts.append(attempt)
+            for lat, lon, matched, score in attempt["candidates"]:
+                # O sinal de menos da latitude é minúsculo e pode desaparecer.
+                if prefer_negative_lat and 0 < lat <= 12.0 and -75.5 <= lon <= -30.0:
+                    lat = -lat
+                final_score = score + region_bonus.get(region_name, 0.0)
+                all_candidates.append(
+                    (lat, lon, matched, final_score, f"{region_name}:{attempt['variant']}")
+                )
+
+        # Quando a região mais específica produz um candidato muito forte, evita
+        # OCR desnecessário nas áreas maiores.
+        if all_candidates and max(c[3] for c in all_candidates) >= 115.0:
+            break
 
     if all_candidates:
-        # Votação entre as variantes de pré-processamento. OCR pode inserir/remover
-        # um dígito em uma variante isolada; a coordenada real costuma se repetir.
-        from collections import Counter
+        # Agrupa leituras quase iguais. Isso neutraliza pequenas diferenças entre
+        # variantes (ex.: quinta casa decimal) sem misturar coordenadas distintas.
+        clusters: dict[tuple[float, float], list[tuple[float, float, str, float, str]]] = {}
+        for item in all_candidates:
+            lat, lon = item[0], item[1]
+            key = (round(lat, 3), round(lon, 3))
+            clusters.setdefault(key, []).append(item)
 
-        br_candidates = [
-            c for c in all_candidates
-            if -35.5 <= c[0] <= 6.5 and -75.5 <= c[1] <= -30.0
-        ]
-        pool = br_candidates or all_candidates
-        keys = [(round(c[0], 5), round(c[1], 5)) for c in pool]
-        counts = Counter(keys)
-        best_key, _ = counts.most_common(1)[0]
-        members = [c for c, key in zip(pool, keys) if key == best_key]
-        # Prefere membro com sinal negativo na latitude quando o consenso é negativo
-        # e, entre eles, o menor número de casas extraídas além das 5 esperadas.
-        best = members[0]
-        lat, lon, matched, name = best
-        out_lat = float(best_key[0])
-        out_lon = float(best_key[1])
-        # As fotos deste fluxo são da operação EQTL_MA. O sinal de menos da latitude
-        # é muito pequeno no carimbo e é o erro de OCR mais comum. Quando configurado,
-        # corrige somente latitudes baixas positivas com longitude oeste do Brasil.
-        if prefer_negative_lat and 0 < out_lat <= 12.0 and -75.5 <= out_lon <= -30.0:
-            out_lat = -out_lat
+        def cluster_rank(items):
+            return (len(items), max(i[3] for i in items), sum(i[3] for i in items))
+
+        best_cluster = max(clusters.values(), key=cluster_rank)
+        best = max(best_cluster, key=lambda i: i[3])
+        lat, lon, matched, _, variant = best
+
+        # Mantém precisão lida pelo OCR. Não arredonda para 3 casas; o arredondamento
+        # acima serve somente para decidir qual grupo de leituras representa o mesmo
+        # carimbo.
         return {
-            "latitude": out_lat,
-            "longitude": out_lon,
+            "latitude": float(lat),
+            "longitude": float(lon),
             "matched_text": matched,
             "ocr_text": "\n---\n".join(
-                f"[{a['variant']}] {a['text'].strip()}" for a in attempts if a['text'].strip()
+                f"[{a['region']}|{a['variant']}] {a['text'].strip()}"
+                for a in all_attempts
+                if str(a.get("text", "")).strip()
             ),
-            "variant": f"consenso:{name}",
-            "attempts": attempts,
+            "variant": variant,
+            "attempts": all_attempts,
+            "photo_auto_cropped": auto_cropped,
+            "ocr_photo_size": prepared.size,
         }
 
     return {
@@ -1036,10 +1267,14 @@ def extract_coordinates_from_photo(photo: Image.Image, lang: str = "eng", prefer
         "longitude": None,
         "matched_text": "",
         "ocr_text": "\n---\n".join(
-            f"[{a['variant']}] {a['text'].strip()}" for a in attempts if a['text'].strip()
+            f"[{a['region']}|{a['variant']}] {a['text'].strip()}"
+            for a in all_attempts
+            if str(a.get("text", "")).strip()
         ),
         "variant": "",
-        "attempts": attempts,
+        "attempts": all_attempts,
+        "photo_auto_cropped": auto_cropped,
+        "ocr_photo_size": prepared.size,
     }
 
 
@@ -1049,51 +1284,91 @@ def extract_largest_photo_from_screen(
     *,
     min_area_ratio: float = 0.02,
 ) -> tuple[Image.Image, tuple[int, int, int, int], bool]:
-    """Recorta a maior área não branca dentro da região do navegador.
+    """Recorta a foto real de um navegador com grande fundo branco.
 
-    Retorna (imagem, bbox absoluto, encontrou_recorte). Se não houver um contorno
-    confiável, retorna a própria região configurada como fallback.
+    Primeiro usa saturação/cor (mais robusto para fotos dentro de IE/Edge) e só
+    depois cai no método antigo de pixels não brancos.
     """
     sw, sh = screenshot.size
     x, y, rw, rh = norm_region_to_abs(region_norm, (sw, sh))
-    area = np.array(screenshot.crop((x, y, x + rw, y + rh)).convert("RGB"))
-    gray = cv2.cvtColor(area, cv2.COLOR_RGB2GRAY)
-    # Fundo do navegador é quase branco. Inverte para transformar foto em primeiro plano.
-    mask = (gray < 245).astype(np.uint8) * 255
-    # Remove linhas finas da barra do navegador antes de fechar pequenos buracos.
-    # Isso evita que uma linha horizontal da UI "cole" a foto a uma grande área branca.
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_img = screenshot.crop((x, y, x + rw, y + rh)).convert("RGB")
+    area = np.array(area_img)
 
+    # Estrategia 1: maior bloco colorido. Em uma página com fundo branco, a foto
+    # de campo é disparado o maior retângulo com saturação relevante.
+    hsv = cv2.cvtColor(area, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    color_mask = ((sat > 28) & (val < 252)).astype(np.uint8) * 255
+    color_mask = cv2.morphologyEx(
+        color_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
+        iterations=2,
+    )
+    color_mask = cv2.morphologyEx(
+        color_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+        iterations=1,
+    )
+    contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
     min_area = max(2500, int(rw * rh * min_area_ratio))
     for cnt in contours:
         bx, by, bw, bh = cv2.boundingRect(cnt)
-        area_px = bw * bh
-        if area_px < min_area:
-            continue
-        # Evita linhas finas/toolbar; fotos têm dimensão substancial em X e Y.
         if bw < 120 or bh < 160:
+            continue
+        if bw * bh < min_area:
+            continue
+        candidates.append((bw * bh, bx, by, bw, bh))
+
+    if candidates:
+        _, bx, by, bw, bh = max(candidates, key=lambda t: t[0])
+        pad = 2
+        bx2 = max(0, bx - pad)
+        by2 = max(0, by - pad)
+        ex = min(rw, bx + bw + pad)
+        ey = min(rh, by + bh + pad)
+        crop = area_img.crop((bx2, by2, ex, ey))
+        if crop.width >= 120 and crop.height >= 160:
+            return crop, (x + bx2, y + by2, ex - bx2, ey - by2), True
+
+    # Estrategia 2: compatibilidade com fotos pouco saturadas.
+    gray = cv2.cvtColor(area, cv2.COLOR_RGB2GRAY)
+    mask = (gray < 245).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for cnt in contours:
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        area_px = bw * bh
+        if area_px < min_area or bw < 120 or bh < 160:
             continue
         candidates.append((area_px, bx, by, bw, bh))
 
     if not candidates:
-        fallback = screenshot.crop((x, y, x + rw, y + rh))
-        return fallback, (x, y, rw, rh), False
+        return area_img, (x, y, rw, rh), False
 
     _, bx, by, bw, bh = max(candidates, key=lambda t: t[0])
-    # Pequena margem interna para evitar bordas do navegador.
     margin = 1
     bx2 = max(0, bx + margin)
     by2 = max(0, by + margin)
     ex = min(rw, bx + bw - margin)
     ey = min(rh, by + bh - margin)
-    crop = Image.fromarray(area[by2:ey, bx2:ex])
+    crop = area_img.crop((bx2, by2, ex, ey))
     return crop, (x + bx2, y + by2, ex - bx2, ey - by2), True
-
 
 def save_debug_image(image: Image.Image, path: Path | str) -> None:
     path = Path(path)
