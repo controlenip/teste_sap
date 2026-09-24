@@ -22,6 +22,7 @@ from modules.config import (
     save_config,
 )
 from modules.sap_bot import SAPPhotoBot
+from modules.word_report import BASE_FILENAME, find_base_workbook
 from modules.vision import (
     configure_tesseract,
     extract_coordinates_from_photo,
@@ -84,8 +85,8 @@ def read_uploaded_obras(file) -> tuple[pd.DataFrame, list[str]]:
 cfg = get_cfg()
 tesseract_cmd = configure_ocr(cfg)
 
-st.markdown("# 📷 Robô SAP — Fotos e Coordenadas")
-st.caption("Automação local para controlar uma sessão RDP/SAP já aberta, localizar fotos específicas, capturar as imagens e extrair latitude/longitude por OCR.")
+st.markdown("# 📷 Robô SAP — Fotos e Relatório Word")
+st.caption("Automação local para coletar os links do SAP, salvar as fotos, extrair a coordenada da fachada e gerar um Word com uma obra por página.")
 
 if not tesseract_cmd:
     st.error("Motor OCR não foi encontrado. Na versão EXE ele deve estar embutido; se esta mensagem aparecer, use a versão portátil/EXE gerada pelo build ou informe um caminho externo na aba Configuração.")
@@ -107,20 +108,46 @@ with exec_tab:
             placeholder="1114882266\n1114307028",
         )
     with c2:
-        st.subheader("Importar lista")
-        up = st.file_uploader("CSV ou Excel (opcional)", type=["csv", "xlsx", "xls"])
+        st.subheader("Importar arquivos")
+        up = st.file_uploader(
+            "Lista de obras — CSV ou Excel (opcional)",
+            type=["csv", "xlsx", "xls"],
+            key="lista_obras",
+        )
         df_up, cols_up = read_uploaded_obras(up) if up else (pd.DataFrame(), [])
         selected_col = None
         if cols_up:
             preferred = next((c for c in cols_up if any(k in c.upper() for k in ["OBRA", "NOTA", "PROTOCOLO"])), cols_up[0])
             selected_col = st.selectbox("Coluna com os números", cols_up, index=cols_up.index(preferred))
-            st.dataframe(df_up.head(10), use_container_width=True, height=220)
+            st.dataframe(df_up.head(8), use_container_width=True, height=175)
+
+        base_up = st.file_uploader(
+            "Base de levantamento para o relatório Word (opcional)",
+            type=["xlsx"],
+            key="base_word",
+            help=(
+                "Use a BASE_LEVANTAMENTO_ATUALIZADA.xlsx. O arquivo serve apenas "
+                "para preencher Nome, Conta Contrato, Instalação, Fase, Endereço, "
+                "Município, Tipo Nota e Informações Extras; ele NÃO adiciona todas "
+                "as notas à execução."
+            ),
+        )
+        if base_up is not None:
+            try:
+                base_target = APP_DIR / BASE_FILENAME
+                base_target.parent.mkdir(parents=True, exist_ok=True)
+                base_target.write_bytes(base_up.getvalue())
+                st.success(f"Base Word atualizada: {base_target.name}")
+            except Exception as exc:
+                st.error(f"Não foi possível salvar a base Word: {exc}")
     with c3:
         st.subheader("Pré-checagem")
         remote_title = cfg["remote"].get("window_title_contains", "")
         rw = find_window_contains(remote_title) if remote_title else None
         st.write("Área Remota:", "🟢 detectada" if rw else "🔴 não detectada")
         st.write("OCR:", "🟢 disponível" if tesseract_cmd else "🔴 indisponível")
+        base_word_path = find_base_workbook()
+        st.write("Base Word:", f"🟢 {base_word_path.name}" if base_word_path else "🔴 não encontrada")
         st.write("Resolução local:", f"{pyautogui.size().width} × {pyautogui.size().height}")
         st.write("Saída:", str(cfg["output"].get("root_folder", "saida")))
 
@@ -187,10 +214,21 @@ with exec_tab:
                 "OBRA": r.get("obra"),
                 "STATUS": "OK" if r.get("ok") else "ERRO",
                 "PASTA": str(r.get("folder", "")),
-                "EXCEL": str(r.get("excel", "")),
-                "ERRO": r.get("error", ""),
+                "WORD": str(r.get("word", "")),
+                "ERRO": r.get("error", r.get("word_error", "")),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        report_word = next((Path(r.get("word")) for r in results if r.get("word") and Path(r.get("word")).exists()), None)
+        if report_word:
+            st.download_button(
+                "📄 Baixar relatório Word — uma obra por página",
+                data=report_word.read_bytes(),
+                file_name=report_word.name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="word_report_main",
+            )
 
         for r in results:
             if not r.get("ok"):
@@ -201,20 +239,9 @@ with exec_tab:
                 if not recs.empty:
                     cols = [c for c in ["TIPO_FOTO", "LATITUDE", "LONGITUDE", "STATUS_LINK", "STATUS_COORDENADA", "ARQUIVO_FOTO"] if c in recs.columns]
                     st.dataframe(recs[cols], use_container_width=True)
-                excel = Path(r.get("excel")) if r.get("excel") else None
                 zip_path = Path(r.get("zip")) if r.get("zip") else None
-                d1, d2 = st.columns(2)
-                if excel and excel.exists():
-                    d1.download_button(
-                        "📊 Baixar Excel",
-                        data=excel.read_bytes(),
-                        file_name=excel.name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"excel_{obra}",
-                        use_container_width=True,
-                    )
                 if zip_path and zip_path.exists():
-                    d2.download_button(
+                    st.download_button(
                         "📦 Baixar pasta ZIP",
                         data=zip_path.read_bytes(),
                         file_name=zip_path.name,
