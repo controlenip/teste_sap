@@ -126,7 +126,11 @@ class SAPPhotoBot:
         self.logs_root.mkdir(parents=True, exist_ok=True)
         self.debug_root.mkdir(parents=True, exist_ok=True)
         pyautogui.FAILSAFE = True
-        pyautogui.PAUSE = 0.08
+        # Modo rapido: reduz a pausa global entre comandos PyAutoGUI.
+        # Pode ser ajustado no config em automation.pyautogui_pause.
+        pyautogui.PAUSE = float(
+            self.cfg.get("automation", {}).get("pyautogui_pause", 0.02)
+        )
 
     @property
     def lang(self) -> str:
@@ -149,11 +153,25 @@ class SAPPhotoBot:
             pass
 
     def _activate_remote(self):
+        """Ativa o RDP apenas quando ele realmente nao esta em primeiro plano.
+
+        A versao anterior chamava activate_window_contains() praticamente em
+        todas as etapas e sempre aguardava 0,35 s. Em listas grandes isso
+        acumulava varios segundos por obra.
+        """
         if not self.cfg.get("remote", {}).get("activate_before_each_step", True):
             return None
         if not self.remote_title:
             raise RuntimeError("O título da Área Remota não está configurado.")
-        return activate_window_contains(self.remote_title, wait=0.35)
+
+        try:
+            active = active_window_title().lower()
+            if self.remote_title.lower() in active:
+                return None
+        except Exception:
+            pass
+
+        return activate_window_contains(self.remote_title, wait=0.08)
 
     def _prepare_remote_for_automation(self):
         """Ativa a Area Remota sem alterar o tamanho da janela.
@@ -164,7 +182,7 @@ class SAPPhotoBot:
         """
         self.emit("Preparando Área Remota...")
         self._activate_remote()
-        time.sleep(0.5)
+        time.sleep(0.12)
 
     def _click_point(self, key: str):
         """Clica em um ponto normalizado RELATIVO À JANELA RDP."""
@@ -187,164 +205,76 @@ class SAPPhotoBot:
         )
         return found is not None
 
-    def _enter_note(self, obra: str):
-        """
-        Informa o número da obra e aguarda a abertura da nota.
+    def _enter_note(self, obra: str, assume_initial: bool = True):
+        """Digita a obra com espera curta e sem OCR bloqueante.
 
-        A confirmação usa uma área ampla do topo da sessão RDP.
-        Se o OCR não conseguir confirmar a tela, o processo não
-        é abortado imediatamente: a etapa seguinte (Dados de Campo 2)
-        fará uma nova validação.
+        No fluxo atual o SAP fica na tela inicial antes de cada nova obra.
+        Por isso o modo rapido usa diretamente o campo Nota inicial e deixa
+        a propria abertura de Dados de Campo 2 funcionar como validacao.
         """
         self._activate_remote()
 
-        point_key = (
-            "note_field_initial"
-            if self._is_initial_note_screen()
-            else "note_field_detail"
-        )
+        point_key = "note_field_initial"
+        if not assume_initial:
+            point_key = (
+                "note_field_initial" if self._is_initial_note_screen()
+                else "note_field_detail"
+            )
 
         self._click_point(point_key)
-        time.sleep(0.25)
-
+        time.sleep(0.05)
         pyautogui.hotkey("ctrl", "a")
-        time.sleep(0.10)
         pyautogui.press("backspace")
-        time.sleep(0.10)
 
         pyautogui.write(
             str(obra),
             interval=float(
-                self.cfg.get("automation", {}).get("typing_interval", 0.035)
+                self.cfg.get("automation", {}).get("typing_interval_fast", 0.01)
             ),
         )
-
-        time.sleep(0.20)
         pyautogui.press("enter")
-
         self.emit(f"Obra {obra}: número informado e ENTER enviado.")
 
-        wait_after_enter = float(
-            self.cfg.get("timing", {}).get("after_note_enter", 3.0)
-        )
-        time.sleep(max(1.5, wait_after_enter))
-
-        # Região ampla do topo, relativa SOMENTE à janela RDP.
-        region_confirmacao = [0.00, 0.00, 1.00, 0.32]
-
-        targets = [
-            "Dados Gerais",
-            "Informações Gerais",
-            "Informacoes Gerais",
-            "Dados de Campo",
-            "Dados de Campo 2",
-            "Orçamento de Conexão",
-            "Orcamento de Conexao",
-            "Status da nota",
-            "Exibir nota de serviço",
-            "Exibir nota de servico",
-        ]
-
-        ok = wait_for_text(
-            targets,
-            region_confirmacao,
-            lang=self.lang,
-            threshold=45,
-            timeout=float(self.cfg.get("timing", {}).get("screen_timeout", 8.0)),
-            poll_interval=float(self.cfg.get("timing", {}).get("poll_interval", 0.45)),
-            window_title=self.remote_title,
-        )
-
-        if ok:
-            self.emit(f"Obra {obra}: tela da nota reconhecida.")
-            return
-
-        # A nota pode estar aberta mesmo quando o OCR falhar por escala,
-        # fonte pequena ou qualidade do RDP. Não aborta aqui.
-        self.emit(
-            (
-                f"Obra {obra}: a nota aparenta ter sido aberta, "
-                f"mas o OCR não conseguiu confirmar a tela. "
-                f"Continuando para Dados de Campo 2..."
-            ),
-            level="warning",
-        )
+        # Espera curta. Se a maquina estiver mais lenta, o usuario pode
+        # aumentar automation.fast_after_note_enter no config.
+        time.sleep(float(
+            self.cfg.get("automation", {}).get("fast_after_note_enter", 0.95)
+        ))
 
     def _open_images_tab(self):
-        """Abre Dados de Campo 2 e, obrigatoriamente, Imagens de Campo.
+        """Abre Dados de Campo 2 -> Imagens de Campo com temporizacao rapida.
 
-        IMPORTANTE:
-        Nesta versao os dois cliques NAO usam mais os pontos antigos do
-        config.json. O bug anterior acontecia porque o config continha uma
-        coordenada antiga para ``imagens_campo_fallback``; como a chave existia,
-        o codigo nunca chegava ao ponto fixo correto.
-
-        Os pontos abaixo sao relativos a janela RDP maximizada e foram obtidos
-        diretamente das telas SAP enviadas pelo usuario.
+        Os cliques fixos ja foram calibrados e estao funcionando; portanto o
+        OCR de confirmacao foi removido desta etapa. A captura da grade Links
+        logo em seguida e a validacao real.
         """
         self._activate_remote()
 
-        # --------------------------------------------------------
-        # 1) DADOS DE CAMPO 2
-        # --------------------------------------------------------
         self.emit("Clicando em Dados de Campo 2...")
-
         x, y = norm_point_in_window_to_abs(
-            self.remote_title,
-            (0.317, 0.197),
-            content_only=False,
+            self.remote_title, (0.317, 0.197), content_only=False
         )
-        pyautogui.moveTo(x, y, duration=0.20)
+        pyautogui.moveTo(x, y, duration=0.05)
         pyautogui.click()
+        time.sleep(float(
+            self.cfg.get("automation", {}).get("fast_after_dados_campo2", 0.65)
+        ))
 
-        # O SAP precisa de um pequeno tempo para montar as subabas.
-        time.sleep(max(1.8, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
-
-        # --------------------------------------------------------
-        # 2) IMAGENS DE CAMPO
-        # --------------------------------------------------------
         self.emit("Clicando em Imagens de Campo...")
-
-        # Ponto fixo da subaba Imagens de Campo na sessao RDP maximizada.
         x, y = norm_point_in_window_to_abs(
-            self.remote_title,
-            (0.292, 0.243),
-            content_only=False,
+            self.remote_title, (0.292, 0.243), content_only=False
         )
-        pyautogui.moveTo(x, y, duration=0.20)
+        pyautogui.moveTo(x, y, duration=0.05)
         pyautogui.click()
 
-        # Segunda tentativa no mesmo ponto caso o primeiro clique ocorra durante
-        # a atualizacao visual do SAP. Nao e doubleClick; sao dois cliques com
-        # intervalo para evitar abrir controles indevidos.
-        time.sleep(0.55)
+        # Segunda tentativa curta, mantendo a robustez da versao anterior.
+        time.sleep(0.18)
         pyautogui.click(x, y)
+        time.sleep(float(
+            self.cfg.get("automation", {}).get("fast_after_imagens_campo", 0.75)
+        ))
 
-        time.sleep(max(2.0, float(self.cfg.get("timing", {}).get("after_tab_click", 1.2))))
-
-        # --------------------------------------------------------
-        # 3) VALIDACAO DA GRADE DE LINKS
-        # --------------------------------------------------------
-        # Essa validacao e informativa. A busca dos JPGs logo depois e a
-        # validacao real, entao o fluxo nao e abortado se o OCR falhar aqui.
-        links = wait_for_text(
-            ["Links", "FACHADA", "ADESIVO", "PANORAMICA", "JPG"],
-            [0.00, 0.20, 0.72, 0.55],
-            lang=self.lang,
-            threshold=32,
-            timeout=5.0,
-            poll_interval=0.35,
-            window_title=self.remote_title,
-        )
-
-        if links:
-            self.emit("Imagens de Campo aberta; grade de links detectada.")
-        else:
-            self.emit(
-                "Imagens de Campo foi clicada. O OCR nao confirmou a grade, "
-                "mas o robo seguira para procurar diretamente os tres JPGs.",
-                level="warning",
-            )
+        self.emit("Imagens de Campo acionada; iniciando captura dos links.")
 
     def _save_ocr_debug(self, obra: str, target_key: str, image: Image.Image, label: str):
         if not self.cfg.get("ocr", {}).get("save_debug_images", True):
@@ -617,57 +547,53 @@ class SAPPhotoBot:
         return result[:40]
 
     def _ocr_one_link_row(self, row: Image.Image) -> str:
-        """OCR dedicado para uma unica linha de hyperlink."""
+        """OCR rapido de uma linha.
+
+        A versao anterior executava ate quatro chamadas ao Tesseract por linha
+        (2 variantes x 2 PSM). Agora faz uma chamada principal e somente uma
+        segunda tentativa se a primeira nao aparentar conter um hyperlink.
+        """
         if row.width < 80 or row.height < 5:
             return ""
 
-        # Faz a linha ter altura suficiente para o Tesseract.
-        scale = max(3, min(7, int(round(90 / max(1, row.height)))))
+        scale = max(3, min(5, int(round(72 / max(1, row.height)))))
         enlarged = row.resize(
             (row.width * scale, row.height * scale),
             Image.Resampling.LANCZOS,
         )
-        gray = ImageOps.grayscale(enlarged)
-        contrast = ImageEnhance.Contrast(gray).enhance(2.35)
-        sharp = contrast.filter(ImageFilter.SHARPEN)
+        sharp = (
+            ImageEnhance.Contrast(ImageOps.grayscale(enlarged))
+            .enhance(2.25)
+            .filter(ImageFilter.SHARPEN)
+        )
 
-        variants = [sharp]
-        try:
-            # Variante binaria ajuda quando a fonte esta muito pequena.
-            binary = sharp.point(lambda p: 255 if p > 195 else 0)
-            variants.append(binary)
-        except Exception:
-            pass
-
-        best = ""
-        best_rank = (-1, -1)
-        for variant in variants:
-            for psm in (7, 6):
+        def run_ocr(image: Image.Image) -> str:
+            try:
+                return pytesseract.image_to_string(
+                    image, lang=self.lang, config="--psm 7"
+                ).strip()
+            except Exception:
                 try:
-                    text = pytesseract.image_to_string(
-                        variant,
-                        lang=self.lang,
-                        config=f"--psm {psm}",
+                    return pytesseract.image_to_string(
+                        image, lang="eng", config="--psm 7"
                     ).strip()
                 except Exception:
-                    try:
-                        text = pytesseract.image_to_string(
-                            variant,
-                            lang="eng",
-                            config=f"--psm {psm}",
-                        ).strip()
-                    except Exception:
-                        text = ""
+                    return ""
 
-                upper = text.upper()
-                rank = (
-                    int("FOTO" in upper or "F0T0" in upper or "PHOTO" in upper),
-                    len(text),
-                )
-                if rank > best_rank:
-                    best_rank = rank
-                    best = text
-        return best
+        text = run_ocr(sharp)
+        upper = text.upper()
+        if any(token in upper for token in ("FOTO", "F0T0", "PHOTO", ".JPG", "JPG")):
+            return text
+
+        # Fallback unico, apenas quando necessario.
+        try:
+            binary = sharp.point(lambda p: 255 if p > 192 else 0)
+            retry = run_ocr(binary)
+            if len(retry) > len(text):
+                return retry
+        except Exception:
+            pass
+        return text
 
     def _ocr_links_from_candidate_area(
         self,
@@ -739,10 +665,31 @@ class SAPPhotoBot:
 
         return urls, debug_lines
 
+    def _links_page_looks_complete(self, image: Image.Image, urls: list[str]) -> bool:
+        """Detecta quando todos os links ja cabem na pagina visivel.
+
+        Se existem varios links reconhecidos e a parte inferior da grade esta
+        praticamente vazia/branca, nao ha motivo para capturar uma segunda
+        pagina. Isso elimina OCR e rolagens desnecessarias nas obras comuns.
+        """
+        if len(urls) < 3:
+            return False
+        try:
+            import numpy as np
+            gray = np.array(ImageOps.grayscale(image))
+            h = gray.shape[0]
+            bottom = gray[int(h * 0.74):, :]
+            if bottom.size == 0:
+                return False
+            dark_ratio = float((bottom < 225).mean())
+            return dark_ratio < 0.012
+        except Exception:
+            return False
+
     def _collect_all_urls_from_remote(self, obra: str, obra_dir: Path) -> list[str]:
         """CAPTURA os links do SAP por screenshot/OCR, sem abrir nenhum deles."""
         self._activate_remote()
-        time.sleep(0.50)
+        time.sleep(0.12)
 
         temp_dir = obra_dir / "_temp_links_ocr"
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -758,19 +705,20 @@ class SAPPhotoBot:
         max_pages = int(self.cfg.get("automation", {}).get("max_link_pages", 12))
         pages_without_new = 0
 
-        # A primeira captura informa onde mover o mouse para rolar somente a
-        # grade. Nao ha clique de mouse nos hyperlinks.
-        first_image, first_abs = self._capture_links_candidate_area(1, temp_dir)
-        fx, fy, fw, fh = first_abs
-        scroll_x = fx + int(fw * 0.45)
-        scroll_y = fy + int(fh * 0.48)
+        # Posiciona o mouse na grade usando a geometria da propria janela, sem
+        # fazer uma captura extra apenas para descobrir a coordenada.
+        rx, ry, rw, rh = get_window_region_contains(
+            self.remote_title, content_only=False
+        )
+        scroll_x = rx + int(rw * 0.32)
+        scroll_y = ry + int(rh * 0.42)
 
-        # Leva a grade ao topo apenas com a roda do mouse.
-        pyautogui.moveTo(scroll_x, scroll_y, duration=0.12)
-        for _ in range(10):
-            pyautogui.scroll(10)
-            time.sleep(0.04)
-        time.sleep(0.45)
+        # Leva a grade ao topo rapidamente.
+        pyautogui.moveTo(scroll_x, scroll_y, duration=0.04)
+        for _ in range(3):
+            pyautogui.scroll(20)
+            time.sleep(0.02)
+        time.sleep(0.16)
 
         for page in range(1, max_pages + 1):
             image, abs_region = self._capture_links_candidate_area(page, temp_dir)
@@ -796,6 +744,14 @@ class SAPPhotoBot:
                 f"{new_count} novo(s) link(s), {len(urls)} no total."
             )
 
+            # Na maioria das obras todos os links aparecem na primeira tela.
+            if self._links_page_looks_complete(image, page_urls):
+                self.emit(
+                    f"Obra {obra}: fim da lista detectado na pagina {page}; "
+                    "nao sera feita rolagem adicional."
+                )
+                break
+
             if new_count == 0:
                 pages_without_new += 1
             else:
@@ -806,9 +762,9 @@ class SAPPhotoBot:
 
             # Apenas rolagem; NUNCA click() na grade Links.
             ax, ay, aw, ah = abs_region
-            pyautogui.moveTo(ax + int(aw * 0.45), ay + int(ah * 0.48), duration=0.10)
-            pyautogui.scroll(-8)
-            time.sleep(0.65)
+            pyautogui.moveTo(ax + int(aw * 0.45), ay + int(ah * 0.48), duration=0.04)
+            pyautogui.scroll(-10)
+            time.sleep(0.24)
 
         # Sempre preserva o OCR bruto ate o TXT ser criado. Se der erro, ele e
         # muito util para diagnostico.
@@ -834,14 +790,18 @@ class SAPPhotoBot:
         txt_path = obra_dir / f"{obra}_links.txt"
         txt_path.write_text("\n".join(urls) + "\n", encoding="utf-8")
 
-        try:
-            subprocess.Popen(["notepad.exe", str(txt_path)])
-            time.sleep(0.8)
-        except Exception as exc:
-            self.emit(
-                f"Obra {obra}: bloco de notas criado, mas nao abriu automaticamente: {exc}",
-                level="warning",
-            )
+        # O TXT continua sendo criado normalmente, mas abrir o Bloco de Notas
+        # visualmente custa tempo e nao e necessario para o processamento.
+        # Pode ser reativado pelo config automation.open_links_notepad=true.
+        if self.cfg.get("automation", {}).get("open_links_notepad", False):
+            try:
+                subprocess.Popen(["notepad.exe", str(txt_path)])
+                time.sleep(0.20)
+            except Exception as exc:
+                self.emit(
+                    f"Obra {obra}: bloco de notas criado, mas nao abriu automaticamente: {exc}",
+                    level="warning",
+                )
 
         self.emit(
             f"Obra {obra}: {len(urls)} link(s) gravado(s) em {txt_path.name}.",
@@ -878,63 +838,33 @@ class SAPPhotoBot:
         current_obra: str,
         next_obra: Optional[str] = None,
     ) -> None:
-        """
-        Depois de copiar/gravar os links da obra atual:
+        """Volta com ESC e carrega a proxima obra com esperas curtas.
 
-        1. volta imediatamente para a tela inicial do SAP com ESC;
-        2. seleciona o campo Nota;
-        3. apaga o numero da obra atual;
-        4. se houver proxima obra, digita o proximo numero e pressiona ENTER;
-        5. se for a ultima obra, deixa o campo Nota vazio.
-
-        Esta rotina roda ANTES do processamento das fotos no navegador local.
-        Assim, em uma lista com varias obras, toda a coleta de links no SAP e
-        feita primeiro, obra por obra, e somente depois o robo passa a baixar
-        as fotos no navegador do computador.
+        O fluxo foi confirmado pelo usuario: um ESC retorna para a 1a tela.
+        Por isso o OCR de confirmacao intermediario foi removido.
         """
         self._activate_remote()
-
         self.emit(
             f"Obra {current_obra}: links copiados. Voltando para a tela inicial do SAP..."
         )
 
-        # Pela tela enviada pelo usuario, um ESC sai da nota aberta e volta
-        # diretamente para "Exibir nota de servico: 1a tela".
         pyautogui.press("esc")
-        time.sleep(1.35)
+        time.sleep(float(
+            self.cfg.get("automation", {}).get("fast_after_esc", 0.55)
+        ))
 
-        # Se o SAP ainda estiver na tela detalhada por atraso de resposta,
-        # faz uma segunda tentativa segura.
-        try:
-            if not self._is_initial_note_screen():
-                pyautogui.press("esc")
-                time.sleep(1.15)
-        except Exception:
-            # O OCR da tela inicial pode falhar por escala; nao impede o uso
-            # do ponto fixo do campo Nota.
-            pass
-
-        # Campo Nota da tela inicial. Usa a calibracao que ja vinha funcionando
-        # no fluxo normal de entrada das obras.
         try:
             self._click_point("note_field_initial")
         except Exception:
-            # Fallback proporcional observado na tela inicial 1920x1080.
             x, y = norm_point_in_window_to_abs(
-                self.remote_title,
-                (0.122, 0.193),
-                content_only=False,
+                self.remote_title, (0.122, 0.193), content_only=False
             )
             pyautogui.click(x, y)
 
-        time.sleep(0.20)
         pyautogui.hotkey("ctrl", "a")
-        time.sleep(0.08)
         pyautogui.press("backspace")
-        time.sleep(0.12)
 
         next_digits = "".join(ch for ch in str(next_obra or "") if ch.isdigit())
-
         if not next_digits:
             self.emit(
                 f"Obra {current_obra}: ultima obra da lista. Campo Nota foi limpo.",
@@ -945,24 +875,17 @@ class SAPPhotoBot:
         pyautogui.write(
             next_digits,
             interval=float(
-                self.cfg.get("automation", {}).get("typing_interval", 0.035)
+                self.cfg.get("automation", {}).get("typing_interval_fast", 0.01)
             ),
         )
-        time.sleep(0.15)
         pyautogui.press("enter")
-
         self.emit(
             f"Proxima obra {next_digits}: numero informado e ENTER enviado.",
             level="success",
         )
-
-        # Deixa a proxima nota completamente carregada para a proxima iteracao
-        # da fase SAP. Nao abre Dados de Campo 2 aqui; isso ocorre no inicio da
-        # iteracao seguinte.
-        wait_after_enter = float(
-            self.cfg.get("timing", {}).get("after_note_enter", 3.0)
-        )
-        time.sleep(max(1.5, wait_after_enter))
+        time.sleep(float(
+            self.cfg.get("automation", {}).get("fast_after_note_enter", 0.95)
+        ))
 
     def _process_local_links_for_obra(
         self,
@@ -1150,6 +1073,36 @@ class SAPPhotoBot:
         compact = re.sub(r"[^A-Z0-9]", "", normalized)
         return any(re.sub(r"[^A-Z0-9]", "", a) in compact for a in FACADE_ALIASES)
 
+    def _download_photo_http_fast(self, url: str) -> tuple[Optional[Image.Image], str]:
+        """Tenta baixar a imagem diretamente antes de abrir o navegador.
+
+        Esta e a maior otimizacao da etapa local: na versao anterior cada URL
+        abria uma aba e aguardava ~2,8 s ANTES de tentar o download HTTP.
+        Quando o servidor aceita a requisicao direta, a foto agora e obtida em
+        fracoes de segundo e nenhuma aba precisa ser aberta.
+        """
+        local_url = urlparse.quote(url, safe=":/?&=%#@+;,[]")
+        try:
+            req = urlrequest.Request(
+                local_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                    )
+                },
+            )
+            timeout = float(
+                self.cfg.get("automation", {}).get("http_photo_timeout", 6.0)
+            )
+            with urlrequest.urlopen(req, timeout=timeout) as response:
+                raw = response.read()
+            photo = Image.open(BytesIO(raw))
+            photo.load()
+            return photo.convert("RGB"), "download_http_fast"
+        except Exception as exc:
+            return None, str(exc)
+
     def _open_url_from_txt_in_default_browser(
         self, obra: str, index: int, total: int, url: str
     ):
@@ -1164,19 +1117,19 @@ class SAPPhotoBot:
                 os.startfile(url)  # type: ignore[attr-defined]
             except Exception as exc:
                 raise RuntimeError(f"Nao foi possivel abrir o navegador padrao: {exc}") from exc
-        time.sleep(float(self.cfg.get("timing", {}).get("browser_photo_load", 2.8)))
+        time.sleep(float(self.cfg.get("automation", {}).get("fast_browser_photo_load", 1.15)))
 
         # O link foi aberto pelo processo LOCAL. Se o RDP continuar em primeiro
         # plano, tenta alternar para a janela local recem-aberta. Isso nao envia
         # nenhum clique ao hyperlink do SAP; acontece somente depois que o TXT
         # ja foi criado.
         try:
-            for _ in range(4):
+            for _ in range(2):
                 active = active_window_title().lower()
                 if self.remote_title.lower() not in active:
                     break
                 pyautogui.hotkey("alt", "tab")
-                time.sleep(0.45)
+                time.sleep(0.18)
         except Exception:
             pass
 
@@ -1196,7 +1149,7 @@ class SAPPhotoBot:
                     )
                 },
             )
-            with urlrequest.urlopen(req, timeout=30) as response:
+            with urlrequest.urlopen(req, timeout=6) as response:
                 raw = response.read()
             photo = Image.open(BytesIO(raw))
             photo.load()
@@ -1210,7 +1163,7 @@ class SAPPhotoBot:
                 pyautogui.hotkey("alt", "space")
                 time.sleep(0.15)
                 pyautogui.press("x")
-                time.sleep(0.6)
+                time.sleep(0.25)
 
             screen = pyautogui.screenshot()
             candidate, _, cropped = extract_largest_photo_from_screen(
@@ -1233,9 +1186,15 @@ class SAPPhotoBot:
         url: str,
         obra_dir: Path,
     ) -> dict:
-        self._open_url_from_txt_in_default_browser(obra, index, total, url)
+        # Primeiro tenta o download direto. So abre o navegador se o servidor
+        # recusar a requisicao HTTP local.
+        photo, source = self._download_photo_http_fast(url)
+        browser_opened = False
+        if photo is None:
+            self._open_url_from_txt_in_default_browser(obra, index, total, url)
+            browser_opened = True
+            photo, source = self._load_photo_from_local_browser_or_http(url)
 
-        photo, source = self._load_photo_from_local_browser_or_http(url)
         is_facade = self._is_facade_url(url)
         filename = self._safe_photo_filename(url, index)
         out_file = self._unique_photo_path(obra_dir, filename)
@@ -1271,20 +1230,21 @@ class SAPPhotoBot:
             photo.save(obra_dir / f"{obra}_FACHADADOIMOVEL.jpg", quality=95)
             photo.save(obra_dir / f"{obra}.jpg", quality=95)
 
-        if self.cfg.get("ocr", {}).get("save_debug_images", True):
+        if is_facade and self.cfg.get("ocr", {}).get("save_debug_images", True):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             try:
                 photo.save(self.debug_root / f"{obra}_{index:03d}_{stamp}.jpg", quality=88)
             except Exception:
                 pass
 
-        try:
-            active = active_window_title().lower()
-            if active and self.remote_title.lower() not in active:
-                pyautogui.hotkey("ctrl", "w")
-                time.sleep(0.30)
-        except Exception:
-            pass
+        if browser_opened:
+            try:
+                active = active_window_title().lower()
+                if active and self.remote_title.lower() not in active:
+                    pyautogui.hotkey("ctrl", "w")
+                    time.sleep(0.12)
+            except Exception:
+                pass
 
         return {
             "path": out_file,
