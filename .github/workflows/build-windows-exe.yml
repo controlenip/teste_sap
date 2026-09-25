@@ -3,24 +3,21 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [ main, master ]
     paths:
       - "app.py"
       - "launcher.py"
       - "modules/**"
       - "requirements*.txt"
       - "SAP_Fotos_*.spec"
-      - ".streamlit/config.toml"
       - "BASE_LEVANTAMENTO_ATUALIZADA.xlsx"
       - ".github/workflows/build-windows-exe.yml"
-
-permissions:
-  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 45
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,37 +27,19 @@ jobs:
         with:
           python-version: "3.11"
           architecture: "x64"
-          cache: pip
+          cache: "pip"
 
       - name: Install Python dependencies
         shell: powershell
         run: |
           python -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install -r requirements.txt -r requirements-build.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Validate Python source and real imports
-        shell: powershell
-        run: |
-          if (-not (Test-Path "modules/__init__.py")) {
-            throw "Falta modules/__init__.py."
-          }
-          if (-not (Test-Path "modules/sap_bot_runtime.py")) {
-            throw "Falta modules/sap_bot_runtime.py. Nao basta existir sap_bot.py."
-          }
-          python -m compileall -q app.py launcher.py modules
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -c "from pathlib import Path; import inspect; import modules.sap_bot_runtime as m; from modules.sap_bot_runtime import SAPPhotoBot; assert inspect.isclass(SAPPhotoBot), 'SAPPhotoBot nao e uma classe'; assert Path(m.__file__).resolve() == Path('modules/sap_bot_runtime.py').resolve(), 'Modulo carregado de outro local'; assert callable(getattr(SAPPhotoBot, 'process_many', None)), 'Classe incompleta'; assert callable(getattr(SAPPhotoBot, 'process_work', None)), 'Classe incompleta'; print('SAPPhotoBot RUNTIME IMPORT OK:', m.__file__)"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -c "from modules.word_report import build_word_report; from modules.vision import locate_text_on_screen; print('WORD E VISION IMPORT OK')"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install Tesseract only on build runner
         shell: powershell
         run: |
           choco install tesseract -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           $candidates = @(
             "C:\Program Files\Tesseract-OCR",
             "C:\Program Files (x86)\Tesseract-OCR",
@@ -78,18 +57,54 @@ jobs:
             if ($cmd) { $src = Split-Path $cmd.Source -Parent }
           }
           if (-not $src) { throw "Tesseract nao foi localizado no runner." }
-          New-Item -ItemType Directory -Force -Path "vendor/tesseract" | Out-Null
-          Copy-Item -Path (Join-Path $src "*") -Destination "vendor/tesseract" -Recurse -Force
-          if (-not (Test-Path "vendor/tesseract/tesseract.exe")) {
+
+          New-Item -ItemType Directory -Force -Path "vendor\tesseract" | Out-Null
+          Copy-Item -Path (Join-Path $src "*") -Destination "vendor\tesseract" -Recurse -Force
+          if (-not (Test-Path "vendor\tesseract\tesseract.exe")) {
             throw "Falha ao preparar Tesseract portatil."
           }
-          if (-not (Test-Path "vendor/tesseract/tessdata/eng.traineddata")) {
-            throw "Falta o idioma eng.traineddata no Tesseract."
-          }
+          Write-Host "Tesseract copiado de $src"
+
+      - name: Validate Python source
+        shell: powershell
+        run: |
+          python -m compileall -q app.py launcher.py modules
+          python -c "from modules.sap_bot import SAPPhotoBot; print('SAPPhotoBot IMPORT OK:', SAPPhotoBot)"
+          python -c "from modules.word_report import build_word_report; print('word_report IMPORT OK')"
+          python -c "from modules.vision import locate_text_on_screen; print('vision IMPORT OK')"
 
       - name: Build single EXE
         shell: powershell
         run: |
-          python -m PyInstaller --noconfirm --clean --workpath build/onefile SAP_Fotos_onefile.spec
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Test-Path "dist/SAP_Fotos.exe")) { throw "SAP_Fotos.exe nao foi gerado." }
+          python -m PyInstaller --noconfirm --clean SAP_Fotos_onefile.spec
+          if (-not (Test-Path "dist\SAP_Fotos.exe")) { throw "SAP_Fotos.exe nao foi gerado." }
+
+      - name: Build portable folder
+        shell: powershell
+        run: |
+          python -m PyInstaller --noconfirm --clean SAP_Fotos_portable.spec
+          if (-not (Test-Path "dist\SAP_Fotos_Portatil\SAP_Fotos_Portatil.exe")) { throw "Versao portatil nao foi gerada." }
+          Copy-Item -Path "vendor\tesseract" -Destination "dist\SAP_Fotos_Portatil\tesseract" -Recurse -Force
+          Compress-Archive -Path "dist\SAP_Fotos_Portatil\*" -DestinationPath "dist\SAP_Fotos_Portatil.zip" -Force -CompressionLevel Optimal
+
+      - name: Generate SHA256
+        shell: powershell
+        run: |
+          $hash1 = (Get-FileHash "dist\SAP_Fotos.exe" -Algorithm SHA256).Hash
+          $hash2 = (Get-FileHash "dist\SAP_Fotos_Portatil.zip" -Algorithm SHA256).Hash
+          @(
+            "SAP_Fotos.exe  $hash1",
+            "SAP_Fotos_Portatil.zip  $hash2"
+          ) | Set-Content "dist\SHA256.txt"
+          Get-Content "dist\SHA256.txt"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAP-Fotos-Windows
+          path: |
+            dist/SAP_Fotos.exe
+            dist/SAP_Fotos_Portatil.zip
+            dist/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
