@@ -1,96 +1,121 @@
-from __future__ import annotations
+                # apaga obra atual -> digita a proxima -> ENTER.
+                self._return_to_initial_and_load_next(
+                    current_obra=obra,
+                    next_obra=next_obra,
+                )
 
-import ctypes
-import json
-import os
-import re
-import shutil
-import subprocess
-import time
-import webbrowser
-from ctypes import wintypes
-from io import BytesIO
-from urllib import error as urlerror
-from urllib import parse as urlparse
-from urllib import request as urlrequest
-from datetime import datetime
-from collections import Counter
-from difflib import SequenceMatcher
-from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional
+            except pyautogui.FailSafeException as exc:
+                self._error_screenshot(obra, "FAILSAFE")
+                results_by_obra[obra] = {
+                    "obra": obra,
+                    "ok": False,
+                    "error": "Automacao interrompida pelo usuario (FAILSAFE).",
+                    "records": [],
+                }
+                self.emit(
+                    f"Obra {obra}: execucao interrompida pelo FAILSAFE.",
+                    level="error",
+                )
+                break
+            except Exception as exc:
+                self._error_screenshot(obra, "COLETA_SAP")
+                self.emit(f"Obra {obra}: ERRO na coleta SAP - {exc}", level="error")
+                results_by_obra[obra] = {
+                    "obra": obra,
+                    "ok": False,
+                    "error": str(exc),
+                    "records": [],
+                }
 
-import pyautogui
-import pyperclip
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+                # Tenta voltar para a tela inicial e carregar a proxima obra
+                # mesmo quando a coleta atual falhar, para nao travar a lista.
+                try:
+                    self._return_to_initial_and_load_next(obra, next_obra)
+                except Exception as nav_exc:
+                    self.emit(
+                        f"Obra {obra}: nao foi possivel preparar a proxima obra: {nav_exc}",
+                        level="error",
+                    )
+                    break
 
-from .config import APP_DIR, resolve_output_root
-from .word_report import build_word_report, default_report_path
-from .vision import (
-    click_text,
-    extract_coordinates_from_photo,
-    extract_largest_photo_from_screen,
-    locate_text_on_screen,
-    locate_link_filename_on_screen,
-    locate_link_row_robust,
-    locate_link_row_strict,
-    locate_link_row_fullscreen,
-    detect_link_row_centers,
-    save_debug_image,
-    wait_for_text,
-)
-from .window_control import (
-    activate_window_contains,
-    maximize_window_contains,
-    norm_point_in_window_to_abs,
-    get_window_region_contains,
-    screenshot_window_contains,
-    active_window_title,
-)
+        # ------------------------------------------------------------
+        # FASE 2: PROCESSAMENTO LOCAL DOS TXTs JA COLETADOS
+        # ------------------------------------------------------------
+        if remote_jobs:
+            self.emit(
+                "Coleta no SAP concluida. Iniciando processamento das fotos no navegador local...",
+                level="success",
+                progress=0.34,
+            )
 
-ProgressCallback = Callable[[str, str, Optional[float]], None]
+        for local_idx, job in enumerate(remote_jobs):
+            obra = job["obra"]
+            try:
+                start = 0.34 + (0.64 * local_idx / max(1, len(remote_jobs)))
+                end = 0.34 + (0.64 * (local_idx + 1) / max(1, len(remote_jobs)))
+                result = self._process_local_links_for_obra(
+                    obra=obra,
+                    obra_dir=job["obra_dir"],
+                    txt_path=job["txt_path"],
+                    all_urls=job["urls"],
+                    progress_start=start,
+                    progress_end=min(0.99, end),
+                )
+                results_by_obra[obra] = result
+            except Exception as exc:
+                self.emit(f"Obra {obra}: ERRO no processamento local - {exc}", level="error")
+                results_by_obra[obra] = {
+                    "obra": obra,
+                    "ok": False,
+                    "error": str(exc),
+                    "records": [],
+                }
 
+        # Monta um unico Word consolidado, com uma obra por pagina.
+        # O Word substitui os antigos arquivos Excel de coordenadas.
+        ordered_results = [
+            results_by_obra.get(obra, {
+                "obra": obra,
+                "ok": False,
+                "error": "Obra nao processada.",
+                "records": [],
+            })
+            for obra in normalized
+        ]
 
-# ---------------------------------------------------------------------------
-# Clipboard do Windows
-# ---------------------------------------------------------------------------
-# A Area de Trabalho Remota precisa estar com o redirecionamento de clipboard
-# habilitado. Assim, o Ctrl+C feito dentro do SAP chega ao clipboard do PC local.
-CF_UNICODETEXT = 13
+        successful = [r for r in ordered_results if r.get("ok")]
+        if successful:
+            try:
+                report_path = default_report_path(self.output_root)
+                word_path, base_used = build_word_report(successful, report_path)
+                for r in successful:
+                    r["word"] = word_path
+                    r["base_word"] = base_used
+                self.emit(
+                    f"Relatorio Word concluido: {word_path.name} "
+                    f"({len(successful)} obra(s), uma por pagina).",
+                    level="success",
+                    progress=1.0,
+                )
+                if base_used:
+                    self.emit(
+                        f"Base utilizada no Word: {Path(base_used).name}.",
+                        level="info",
+                    )
+                else:
+                    self.emit(
+                        "Base de levantamento nao encontrada. O Word foi gerado "
+                        "com os campos adicionais em branco.",
+                        level="warning",
+                    )
+            except Exception as exc:
+                self.emit(
+                    f"Falha ao gerar relatorio Word: {exc}",
+                    level="error",
+                )
+                for r in successful:
+                    r["word"] = None
+                    r["word_error"] = str(exc)
 
-
-def _clear_windows_clipboard() -> None:
-    user32 = ctypes.windll.user32
-    if user32.OpenClipboard(None):
-        try:
-            user32.EmptyClipboard()
-        finally:
-            user32.CloseClipboard()
-
-
-def _read_windows_clipboard_text() -> str:
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-
-    user32.GetClipboardData.argtypes = [wintypes.UINT]
-    user32.GetClipboardData.restype = wintypes.HANDLE
-    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
-    kernel32.GlobalLock.restype = wintypes.LPVOID
-    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
-
-    if not user32.OpenClipboard(None):
-        return ""
-
-    try:
-        handle = user32.GetClipboardData(CF_UNICODETEXT)
-        if not handle:
-            return ""
-        ptr = kernel32.GlobalLock(handle)
-        if not ptr:
-            return ""
-        try:
-            return ctypes.wstring_at(ptr)
-        finally:
-            kernel32.GlobalUnlock(handle)
-    finally:
-        user32.CloseClipboard()
+        # Mantem exatamente a mesma ordem digitada/colada na ferramenta.
+        return ordered_results
