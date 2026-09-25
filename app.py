@@ -21,7 +21,7 @@ from modules.config import (
     load_config,
     save_config,
 )
-from modules.sap_bot_runtime import SAPPhotoBot
+from modules.sap_bot import SAPPhotoBot
 from modules.word_report import BASE_FILENAME, find_base_workbook
 from modules.vision import (
     configure_tesseract,
