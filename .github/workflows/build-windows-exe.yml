@@ -69,6 +69,9 @@ jobs:
         shell: powershell
         run: |
           python -m compileall -q app.py launcher.py modules
+          python -c "from modules.sap_bot_runtime import SAPPhotoBot; print('SAPPhotoBot RUNTIME IMPORT OK:', SAPPhotoBot)"
+          python -c "from modules.word_report import build_word_report; print('word_report IMPORT OK')"
+          python -c "from modules.vision import locate_text_on_screen; print('vision IMPORT OK')"
 
       - name: Build single EXE
         shell: powershell
