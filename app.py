@@ -91,6 +91,6 @@ st.caption("Automação local para coletar os links do SAP, salvar as fotos, ext
 if not tesseract_cmd:
     st.error("Motor OCR não foi encontrado. Na versão EXE ele deve estar embutido; se esta mensagem aparecer, use a versão portátil/EXE gerada pelo build ou informe um caminho externo na aba Configuração.")
 
-st.warning(
-    "**Antes de executar:** deixe a Área Remota e o SAP abertos. Não use mouse/teclado durante o processamento. "
-    "Para interromper imediatamente o PyAutoGUI, mova o mouse para o **canto superior esquerdo da tela**."
+st.warning("**Antes de executar:** deixe a Área Remota e o SAP abertos. Não use mouse/teclado durante o processamento. Para interromper imediatamente o PyAutoGUI, mova o mouse para o **canto superior esquerdo da tela**.")
+
+exec_tab, calib_tab, diag_tab, cfg_tab = st.tabs(["🚀 Executar", "🎯 Calibração", "🧪 Diagnóstico", "⚙️ Configuração"])
