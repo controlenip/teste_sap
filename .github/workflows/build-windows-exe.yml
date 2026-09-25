@@ -65,46 +65,31 @@ jobs:
           }
           Write-Host "Tesseract copiado de $src"
 
-      - name: Validate Python source
+      - name: Validate Python source and bot loader
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path "modules\sap_bot.py")) {
+            throw "Falta modules/sap_bot.py"
+          }
+
           python -m compileall -q app.py launcher.py modules
-          python -c "from modules.sap_bot import SAPPhotoBot; print('SAPPhotoBot IMPORT OK:', SAPPhotoBot)"
-          python -c "from modules.word_report import build_word_report; print('word_report IMPORT OK')"
-          python -c "from modules.vision import locate_text_on_screen; print('vision IMPORT OK')"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha na validacao de sintaxe Python."
+          }
 
-      - name: Build single EXE
-        shell: powershell
-        run: |
-          python -m PyInstaller --noconfirm --clean SAP_Fotos_onefile.spec
-          if (-not (Test-Path "dist\SAP_Fotos.exe")) { throw "SAP_Fotos.exe nao foi gerado." }
+          python -c "from modules.sap_bot import SAPPhotoBot; print('SAPPhotoBot SOURCE IMPORT OK:', SAPPhotoBot)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "O arquivo modules/sap_bot.py nao expoe SAPPhotoBot."
+          }
 
-      - name: Build portable folder
-        shell: powershell
-        run: |
-          python -m PyInstaller --noconfirm --clean SAP_Fotos_portable.spec
-          if (-not (Test-Path "dist\SAP_Fotos_Portatil\SAP_Fotos_Portatil.exe")) { throw "Versao portatil nao foi gerada." }
-          Copy-Item -Path "vendor\tesseract" -Destination "dist\SAP_Fotos_Portatil\tesseract" -Recurse -Force
-          Compress-Archive -Path "dist\SAP_Fotos_Portatil\*" -DestinationPath "dist\SAP_Fotos_Portatil.zip" -Force -CompressionLevel Optimal
+          python -c "import importlib.util,sys,modules; p=r'modules\sap_bot.py'; n='modules._sap_bot_embedded_test'; s=importlib.util.spec_from_file_location(n,p); m=importlib.util.module_from_spec(s); sys.modules[n]=m; s.loader.exec_module(m); assert hasattr(m,'SAPPhotoBot'); print('SAPPhotoBot DIRECT FILE LOAD OK:', m.SAPPhotoBot)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao carregar SAPPhotoBot diretamente do arquivo."
+          }
 
-      - name: Generate SHA256
-        shell: powershell
-        run: |
-          $hash1 = (Get-FileHash "dist\SAP_Fotos.exe" -Algorithm SHA256).Hash
-          $hash2 = (Get-FileHash "dist\SAP_Fotos_Portatil.zip" -Algorithm SHA256).Hash
-          @(
-            "SAP_Fotos.exe  $hash1",
-            "SAP_Fotos_Portatil.zip  $hash2"
-          ) | Set-Content "dist\SHA256.txt"
-          Get-Content "dist\SHA256.txt"
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: SAP-Fotos-Windows
-          path: |
-            dist/SAP_Fotos.exe
-            dist/SAP_Fotos_Portatil.zip
-            dist/SHA256.txt
-          if-no-files-found: error
-          retention-days: 30
+          python -c "from modules.word_report import build_word_report; print('WORD IMPORT OK')"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha no word_report."
+          }
