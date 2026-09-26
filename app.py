@@ -300,74 +300,180 @@ class SAPPhotoBot:
     def _open_images_tab(self):
         """Abre Dados de Campo 2 -> Imagens de Campo.
 
-        A faixa de OCR de Imagens de Campo foi recalibrada para a linha real
-        das subabas do SAP. A versao anterior procurava muito abaixo da guia,
-        por isso o OCR falhava e o fallback apenas posicionava o cursor em uma
-        regiao incorreta.
+        Nesta versao, o clique principal nao usa mais a faixa antiga de OCR
+        que incluia a barra superior do SAP. Essa faixa podia confundir
+        "Organizacao..." com "Dados de Campo 2".
 
-        O clique agora usa o ponto exato retornado pelo OCR e, se necessario,
-        repete no MESMO ponto com metodos de clique diferentes.
+        A primeira tentativa usa um ponto normalizado calibrado exatamente na
+        linha das abas principais. O OCR fica restrito somente a essa linha e
+        serve como confirmacao/fallback.
+
+        Depois, a busca de "Imagens de Campo" e feita somente na linha das
+        subabas de Dados de Campo 2.
         """
         self._activate_remote()
 
-        # --------------------------------------------------------------
+        # ============================================================
         # 1) DADOS DE CAMPO 2
-        # --------------------------------------------------------------
-        self.emit("Localizando Dados de Campo 2...")
+        # ============================================================
+        self.emit("Abrindo Dados de Campo 2...")
 
-        found, _, _ = locate_text_on_screen(
+        # Layout observado no SAP:
+        # aba principal em aproximadamente 33,5% da largura da janela RDP
+        # e 17,8% da altura.
+        #
+        # O valor antigo usava Y ~= 8,7%, que fica na barra superior onde
+        # aparece "Organizacao...". Por isso o robo clicava no lugar errado.
+        primary_fallback = (0.335, 0.178)
+
+        x_primary, y_primary = norm_point_in_window_to_abs(
+            self.remote_title,
+            primary_fallback,
+            content_only=False,
+        )
+
+        self.emit(
+            f"Clicando no ponto calibrado de Dados de Campo 2: "
+            f"X={x_primary}, Y={y_primary}."
+        )
+
+        self._native_left_click(
+            x_primary,
+            y_primary,
+            repeat=1,
+        )
+
+        time.sleep(float(
+            self.cfg.get("automation", {}).get(
+                "fast_after_dados_campo2",
+                0.70,
+            )
+        ))
+
+        # Verifica se a linha de subabas de Dados de Campo 2 apareceu.
+        subtab_ready = wait_for_text(
             [
-                "Dados de Campo 2",
-                "Dados de Campo2",
-                "DadosdeCampo2",
-                "Dados Campo 2",
+                "Fornecimento",
+                "Imagens de Campo",
+                "Financ. de Padrao",
+                "Financ de Padrao",
+                "Qualidade",
             ],
-            [0.00, 0.025, 0.90, 0.16],
+            [0.00, 0.185, 0.88, 0.115],
             lang=self.lang,
-            threshold=30,
-            psm=6,
+            threshold=38,
+            timeout=0.90,
+            poll_interval=0.18,
             window_title=self.remote_title,
         )
 
-        if found:
-            x, y = found.center
-            pyautogui.moveTo(x, y, duration=0.08)
-            pyautogui.click(x, y)
-            self.emit(f"Dados de Campo 2 acionado em X={x}, Y={y}.")
-        else:
-            # Mantem o fallback existente apenas para Dados de Campo 2.
-            x, y = norm_point_in_window_to_abs(
-                self.remote_title,
-                (0.320, 0.087),
-                content_only=False,
-            )
-            pyautogui.moveTo(x, y, duration=0.08)
-            pyautogui.click(x, y)
+        # Se o clique calibrado nao funcionou, usa OCR RESTRITO apenas a
+        # linha das abas principais. Essa faixa nao inclui "Organizacao...".
+        if not subtab_ready:
             self.emit(
-                f"OCR nao localizou Dados de Campo 2; fallback em X={x}, Y={y}.",
+                "A linha de subabas ainda nao apareceu; "
+                "localizando Dados de Campo 2 somente na faixa correta...",
                 level="warning",
             )
 
-        time.sleep(float(
-            self.cfg.get("automation", {}).get("fast_after_dados_campo2", 0.75)
-        ))
+            found_primary = None
 
-        # --------------------------------------------------------------
+            primary_regions = (
+                [0.10, 0.145, 0.68, 0.075],
+                [0.08, 0.135, 0.72, 0.095],
+            )
+
+            for region in primary_regions:
+                found_try, _, _ = locate_text_on_screen(
+                    [
+                        "Dados de Campo 2",
+                        "Dados de Campo2",
+                        "Dados Campo 2",
+                        "DadosdeCampo2",
+                    ],
+                    region,
+                    lang=self.lang,
+                    threshold=52,
+                    psm=6,
+                    window_title=self.remote_title,
+                )
+
+                if found_try:
+                    found_primary = found_try
+                    break
+
+            if found_primary:
+                x_primary, y_primary = found_primary.center
+
+                self.emit(
+                    f"Dados de Campo 2 localizado pelo OCR em "
+                    f"X={x_primary}, Y={y_primary}."
+                )
+
+                self._native_left_click(
+                    x_primary,
+                    y_primary,
+                    repeat=1,
+                )
+
+            else:
+                # Repete o ponto calibrado, mas com uma pequena variacao
+                # vertical, sempre na linha correta das abas.
+                self.emit(
+                    "OCR nao localizou Dados de Campo 2; "
+                    "repetindo clique calibrado na linha das abas.",
+                    level="warning",
+                )
+
+                for dy in (0, 3, -3):
+                    self._native_left_click(
+                        x_primary,
+                        int(y_primary + dy),
+                        repeat=1,
+                    )
+                    time.sleep(0.25)
+
+            time.sleep(0.55)
+
+            subtab_ready = wait_for_text(
+                [
+                    "Fornecimento",
+                    "Imagens de Campo",
+                    "Financ. de Padrao",
+                    "Financ de Padrao",
+                    "Qualidade",
+                ],
+                [0.00, 0.185, 0.88, 0.115],
+                lang=self.lang,
+                threshold=36,
+                timeout=0.90,
+                poll_interval=0.18,
+                window_title=self.remote_title,
+            )
+
+        if not subtab_ready:
+            raise RuntimeError(
+                "Dados de Campo 2 nao abriu. "
+                "O robo permaneceu fora da linha de subabas esperada."
+            )
+
+        self.emit("Dados de Campo 2 aberto.")
+
+        # ============================================================
         # 2) IMAGENS DE CAMPO
-        # --------------------------------------------------------------
+        # ============================================================
         self.emit("Localizando Imagens de Campo...")
 
-        # IMPORTANTE: a linha das subabas fica aproximadamente entre 5% e
-        # 11% da altura da janela RDP. A versao anterior iniciava em 10,5%
-        # e frequentemente cortava o texto por completo.
-        subtab_regions = (
-            [0.00, 0.045, 0.90, 0.070],
-            [0.00, 0.035, 0.90, 0.090],
-            [0.00, 0.055, 0.90, 0.070],
+        found_images = None
+
+        # A subaba fica abaixo das abas principais, aproximadamente entre
+        # 19% e 28% da altura da janela RDP.
+        image_regions = (
+            [0.00, 0.195, 0.82, 0.090],
+            [0.00, 0.185, 0.86, 0.115],
         )
 
-        found = None
-        for region in subtab_regions:
+        for region in image_regions:
             found_try, _, _ = locate_text_on_screen(
                 [
                     "Imagens de Campo",
@@ -377,87 +483,125 @@ class SAPPhotoBot:
                 ],
                 region,
                 lang=self.lang,
-                threshold=24,
+                threshold=42,
                 psm=6,
                 window_title=self.remote_title,
             )
+
             if found_try:
-                found = found_try
+                found_images = found_try
                 break
 
-        if found:
-            x, y = found.center
+        if found_images:
+            x_images, y_images = found_images.center
+
             self.emit(
-                f"Imagens de Campo localizada em X={x}, Y={y}. Clicando na guia..."
+                f"Imagens de Campo localizada em "
+                f"X={x_images}, Y={y_images}."
             )
+
         else:
-            # Ponto recalibrado para o layout mostrado no teste atual.
-            # Ele fica na propria linha das subabas, e nao no conteudo abaixo.
-            x, y = norm_point_in_window_to_abs(
+            # Ponto proporcional da subaba "Imagens de Campo" no layout
+            # atual do SAP.
+            x_images, y_images = norm_point_in_window_to_abs(
                 self.remote_title,
-                (0.395, 0.078),
+                (0.295, 0.228),
                 content_only=False,
             )
+
             self.emit(
-                f"OCR nao localizou Imagens de Campo; usando fallback recalibrado X={x}, Y={y}.",
+                f"OCR nao localizou Imagens de Campo; "
+                f"usando fallback X={x_images}, Y={y_images}.",
                 level="warning",
             )
 
-        # Primeiro clique: comportamento normal do mouse.
-        pyautogui.moveTo(x, y, duration=0.12)
-        pyautogui.mouseDown(button="left")
-        time.sleep(0.10)
-        pyautogui.mouseUp(button="left")
+        self._native_left_click(
+            x_images,
+            y_images,
+            repeat=1,
+        )
 
         time.sleep(float(
-            self.cfg.get("automation", {}).get("fast_after_imagens_campo", 0.85)
+            self.cfg.get("automation", {}).get(
+                "fast_after_imagens_campo",
+                0.80,
+            )
         ))
 
         def _links_abertos(timeout: float = 1.0) -> bool:
             return bool(wait_for_text(
-                ["Links", "FOTO", ".jpg", ".JPG"],
-                [0.00, 0.075, 0.92, 0.72],
+                [
+                    "Links",
+                    "FOTO",
+                    ".jpg",
+                    ".JPG",
+                ],
+                [0.00, 0.245, 0.93, 0.60],
                 lang=self.lang,
-                threshold=22,
+                threshold=24,
                 timeout=timeout,
                 poll_interval=0.18,
                 window_title=self.remote_title,
             ))
 
-        if _links_abertos(1.1):
-            self.emit("Imagens de Campo aberta; grade Links detectada.")
+        if _links_abertos(1.10):
+            self.emit(
+                "Imagens de Campo aberta; grade Links detectada."
+            )
             return
 
-        # Segunda tentativa: clique nativo, mas UMA unica vez no mesmo ponto.
+        # Segunda tentativa exatamente no mesmo ponto.
         self.emit(
-            "A guia ainda nao abriu; repetindo o clique no mesmo ponto...",
+            "A guia Imagens de Campo ainda nao abriu; "
+            "repetindo clique no mesmo ponto...",
             level="warning",
         )
-        self._activate_remote()
-        pyautogui.moveTo(x, y, duration=0.08)
-        self._native_left_click(x, y, repeat=1)
-        time.sleep(0.70)
 
-        if _links_abertos(0.9):
-            self.emit("Imagens de Campo aberta apos a segunda tentativa.")
+        self._activate_remote()
+        self._native_left_click(
+            x_images,
+            y_images,
+            repeat=1,
+        )
+
+        time.sleep(0.65)
+
+        if _links_abertos(0.90):
+            self.emit(
+                "Imagens de Campo aberta apos a segunda tentativa."
+            )
             return
 
-        # Terceira tentativa: pequeno deslocamento vertical para o centro
-        # clicavel da guia, sem sair da propria aba.
-        for dy in (-3, 3, -5, 5):
-            yy = int(y + dy)
-            pyautogui.moveTo(x, yy, duration=0.06)
-            pyautogui.click(x, yy)
-            time.sleep(0.45)
+        # Ultima tentativa: pequenos ajustes apenas dentro da mesma guia.
+        for dx, dy in (
+            (3, 0),
+            (-3, 0),
+            (0, 3),
+            (0, -3),
+            (5, 0),
+            (-5, 0),
+        ):
+            xx = int(x_images + dx)
+            yy = int(y_images + dy)
+
+            self._native_left_click(
+                xx,
+                yy,
+                repeat=1,
+            )
+
+            time.sleep(0.35)
+
             if _links_abertos(0.55):
                 self.emit(
-                    f"Imagens de Campo aberta apos ajuste fino em X={x}, Y={yy}."
+                    f"Imagens de Campo aberta apos ajuste fino "
+                    f"em X={xx}, Y={yy}."
                 )
                 return
 
         raise RuntimeError(
-            "A aba Imagens de Campo nao abriu. O robo localizou a guia, "
-            "mas o SAP nao confirmou a abertura da grade Links."
+            "Dados de Campo 2 abriu, mas a aba Imagens de Campo "
+            "nao abriu apos as tentativas de clique."
         )
 
     def _save_ocr_debug(self, obra: str, target_key: str, image: Image.Image, label: str):
